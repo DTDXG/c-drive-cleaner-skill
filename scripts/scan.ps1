@@ -14,6 +14,12 @@ DISM 并不总是提供精确可释放字节数；报告区分精确值、估算
 为避免覆盖用户文件，目标文件已存在时停止，不提供覆盖选项。
 .PARAMETER Top
 控制台显示的条目数，默认 25。JSON 始终包含全部发现的条目。
+.PARAMETER LargeFileCount
+原用户目录中展示的大文件数量，默认 30，0 表示不发现大文件。
+.PARAMETER LargeFileMinMB
+大文件逻辑大小门槛，默认 500 MiB；不含 AppData、同步目录和重解析点。
+.PARAMETER InstallerAgeDays
+下载/桌面中安装包和归档的最短年龄，默认 30 天。
 .PARAMETER Quick
 跳过目录递归大小统计、深层软件数据分类和耗时的 DISM 分析；仍读取文件
 元数据、常见目录位置、注册表及 VSS 状态。跳过的大小标为未知。
@@ -35,7 +41,16 @@ param(
     [int]$Top = 25,
 
     [Parameter()]
-    [switch]$Quick
+    [switch]$Quick,
+
+    [ValidateRange(0, 500)]
+    [int]$LargeFileCount = 30,
+
+    [ValidateRange(1, 1048576)]
+    [int]$LargeFileMinMB = 500,
+
+    [ValidateRange(0, 36500)]
+    [int]$InstallerAgeDays = 30
 )
 
 if ($env:OS -ne 'Windows_NT') { throw '此脚本只能在 Windows 上运行。' }
@@ -48,6 +63,8 @@ $script:ScanIssues = New-Object 'System.Collections.Generic.List[object]'
 $script:ScanDriveRoot = 'C:\'
 $script:ScanCloudRoots = New-Object 'System.Collections.Generic.List[string]'
 $script:ScanProfileEnvironment = @{}
+$script:ScanExtraEntries = New-Object 'System.Collections.Generic.List[object]'
+$script:ScanKnownFolders = @{}
 
 function Get-ScanProperty {
     param($Object, [string[]]$Names, $Default = $null)
@@ -197,9 +214,9 @@ function Add-ScanCloudRoot {
     if ([string]::IsNullOrWhiteSpace($LiteralPath) -or $LiteralPath -notmatch '^C:\\') { return }
     $path = $LiteralPath.TrimEnd('\')
     if (-not $script:ScanCloudRoots.Contains($path)) { $script:ScanCloudRoots.Add($path) }
-    Add-ScanTarget -Name 'OneDrive 同步目录（不纳入本地清理量）' -LiteralPath $path -Category 'cloud-onedrive' `
+    Add-ScanTarget -Name '同步目录（仅用客户端释放本地副本）' -LiteralPath $path -Category 'cloud-onedrive' `
         -Action system-tool -Risk 1 -Priority 100 -HandlerScript '' `
-        -Notes '只用 OneDrive 客户端“释放空间”。删除会同步到云端。云占位不计本地占用；已下载文件仍可能占用空间。' `
+        -Notes '只用同步客户端“释放空间/仅在线”。删除会同步到云端。云占位不计本地占用；已下载文件仍可能占用空间。' `
         -MetadataOnly
 }
 
@@ -381,7 +398,12 @@ function Add-ScanUserTargets {
     $documents = New-Object 'System.Collections.Generic.List[string]'
     $documents.Add((Join-Path $Profile 'Documents'))
     foreach ($folder in @('Desktop', 'Documents', 'Downloads', 'Pictures', 'Videos', 'Music')) {
-        Add-ScanTarget -Name ($label + '：' + $folder) -LiteralPath (Join-Path $Profile $folder) -Category 'user-files' `
+        $folderPath = Join-Path $Profile $folder
+        if ($Profile -ieq $script:ScanOriginalProfile -and $folder -ne 'Music') {
+            if (-not $script:ScanKnownFolders.ContainsKey($folder)) { continue }
+            $folderPath = $script:ScanKnownFolders[$folder]
+        }
+        Add-ScanTarget -Name ($label + '：' + $folder) -LiteralPath $folderPath -Category 'user-files' `
             -Action migrate -Risk 1 -HandlerScript 'scripts/migrate.ps1' -Estimate allocated-upper-bound `
             -Notes '通过文件夹属性→位置→移动，或复制校验后切换；预计释放是迁移完成且确认备份后清理源数据的上限。'
     }
@@ -391,6 +413,7 @@ function Add-ScanUserTargets {
         foreach ($valueName in @('Personal', 'Desktop', 'My Pictures', 'My Video', 'My Music', '{374DE290-123F-4565-9164-39C4925E467B}')) {
             $configured = Expand-ScanProfilePath (Get-ScanRegistryValue $shellKey $valueName) $Profile
             if ($configured) {
+                if ($Profile -ieq $script:ScanOriginalProfile -and $configured -notin @($script:ScanKnownFolders.Values)) { continue }
                 if ($valueName -eq 'Personal' -and -not $documents.Contains($configured)) { $documents.Add($configured) }
                 Add-ScanTarget -Name ($label + '：已配置用户文件夹 ' + $valueName) -LiteralPath $configured -Category 'user-files' `
                     -Action migrate -Risk 1 -HandlerScript 'scripts/migrate.ps1' -Estimate allocated-upper-bound
@@ -413,12 +436,19 @@ function Add-ScanUserTargets {
                 Add-ScanTarget -Name ($label + '：WSL 发行版') -LiteralPath $base -Category 'wsl' `
                     -Action migrate -Risk 3 -HandlerScript 'scripts/migrate.ps1' -Estimate allocated-upper-bound `
                     -Notes '仅使用 export/import 并验证；禁止直接删除虚拟磁盘。'
+                $wslKey = $base.TrimEnd('\').ToLowerInvariant()
+                if ($script:ScanTargets.ContainsKey($wslKey)) {
+                    $script:ScanTargets[$wslKey].Details = [pscustomobject]@{ DistributionName = Get-ScanRegistryValue $distro.PSPath 'DistributionName' }
+                }
                 if ($base -match '^C:\\') { Find-ScanVirtualDisks $base ($label + ' WSL') 'wsl-vhdx' }
             }
         }
     }
     foreach ($child in @(Get-ScanChildren $Profile)) {
-        if ($child.PSIsContainer -and $child.Name -match '^OneDrive(?:\s*-.*)?$') { Add-ScanCloudRoot $child.FullName }
+        if (-not $child.PSIsContainer) { continue }
+        foreach ($pattern in (Get-CleanerTargets).SyncDirectoryNames) {
+            if ($child.Name -like $pattern) { Add-ScanCloudRoot $child.FullName; break }
+        }
     }
 
     Add-ScanTarget -Name ($label + '：用户临时文件') -LiteralPath (Join-Path $local 'Temp') -Category 'temp' `
@@ -439,17 +469,6 @@ function Add-ScanUserTargets {
         if (-not $file.PSIsContainer -and $file.Name -like 'thumbcache_*.db') {
             Add-ScanTarget -Name ($label + '：缩略图缓存') -LiteralPath $file.FullName -Category 'thumbnail-cache' `
                 -Action delete -Risk 0 -HandlerScript 'scripts/clean-cache.ps1' -Estimate allocated-upper-bound
-        }
-    }
-    foreach ($browser in @('Google\Chrome\User Data', 'Microsoft\Edge\User Data')) {
-        foreach ($browserProfile in @(Get-ScanChildren (Join-Path $local $browser))) {
-            if (-not $browserProfile.PSIsContainer -or $browserProfile.Name -notmatch '^(Default|Profile \d+|Guest Profile|System Profile)$') { continue }
-            foreach ($cacheName in @('Cache', 'Code Cache', 'GPUCache', 'Network\Cache')) {
-                Add-ScanTarget -Name ($label + '：浏览器 ' + $browserProfile.Name + ' ' + $cacheName) `
-                    -LiteralPath (Join-Path $browserProfile.FullName $cacheName) -Category 'browser-cache' `
-                    -Action delete -Risk 0 -HandlerScript 'scripts/clean-cache.ps1' -Estimate allocated-upper-bound `
-                    -Notes '仅缓存；书签、密码、Cookie 和其余用户数据保留。'
-            }
         }
     }
 
@@ -540,6 +559,13 @@ function Add-ScanUserTargets {
         @('npm 缓存', 'npm-cache', 'local', 'developer-cache', 'system-tool', 1),
         @('npm 旧版缓存', 'npm-cache', 'roaming', 'developer-cache', 'system-tool', 1),
         @('pip 缓存', 'pip\Cache', 'local', 'developer-cache', 'system-tool', 1),
+        @('Yarn 缓存', 'Yarn\Cache', 'local', 'developer-cache', 'system-tool', 1),
+        @('Yarn 旧版缓存', '.cache\yarn', 'profile', 'developer-cache', 'system-tool', 1),
+        @('pnpm store', 'pnpm-store', 'local', 'developer-cache', 'system-tool', 1),
+        @('pnpm store 新版', 'pnpm\store', 'local', 'developer-cache', 'system-tool', 1),
+        @('pnpm 旧版 store', '.pnpm-store', 'profile', 'developer-cache', 'system-tool', 1),
+        @('Go 构建缓存', 'go-build', 'local', 'developer-cache', 'system-tool', 1),
+        @('Go 模块缓存', 'go\pkg\mod', 'profile', 'developer-cache', 'system-tool', 1),
         @('conda 包缓存', '.conda\pkgs', 'profile', 'developer-cache', 'system-tool', 1),
         @('Anaconda 包缓存', 'anaconda3\pkgs', 'profile', 'developer-cache', 'system-tool', 1),
         @('Miniconda 包缓存', 'miniconda3\pkgs', 'profile', 'developer-cache', 'system-tool', 1),
@@ -611,6 +637,311 @@ function Add-ScanUserTargets {
     Find-ScanVirtualDisks (Join-Path $local 'Docker\wsl') ($label + ' Docker') 'docker-vhdx'
     Find-ScanVirtualDisks (Join-Path $local 'wsl') ($label + ' WSL') 'wsl-vhdx'
     Add-ScanToolConfiguredPaths $Profile $local $roaming
+}
+
+function Expand-ScanTargetPattern {
+    param([string]$Pattern, $Context)
+    $expanded = Expand-CleanerPath -Pattern $Pattern -Context $Context
+    if ($expanded -notmatch '^C:\\') { return }
+    $paths = @('C:\')
+    foreach ($segment in $expanded.Substring(3).Split([char]'\')) {
+        $next = @()
+        foreach ($parent in $paths) {
+            if ($segment -match '[*?]') {
+                foreach ($child in @(Get-ScanChildren $parent)) {
+                    if ($child.PSIsContainer -and $child.Name -like $segment -and -not ($child.Attributes -band [IO.FileAttributes]::ReparsePoint)) { $next += $child.FullName }
+                }
+            }
+            else { $next += Join-Path $parent $segment }
+        }
+        $paths = $next
+    }
+    return $paths
+}
+
+function Add-ScanRegisteredCaches {
+    param($Context)
+    $definitions = (Get-CleanerTargets).Categories
+    $slugs = @{ AppCache = 'app-cache'; ShaderCache = 'shader-cache'; InetCache = 'inet-cache'; SystemLogs = 'system-logs'
+        BrowserCache = 'browser-cache'; DevCache = 'developer-cache' }
+    foreach ($name in @('AppCache', 'ShaderCache', 'InetCache', 'SystemLogs', 'BrowserCache', 'DevCache')) {
+        if (-not $definitions.ContainsKey($name)) { continue }
+        foreach ($target in @($definitions[$name].Targets)) {
+            try {
+                foreach ($path in @(Expand-ScanTargetPattern $target.Path $Context)) {
+                    # Gradle 白名单还供迁移使用，clean-cache 没有对应的官方清理动作。
+                    if ($name -eq 'DevCache' -and $path -match '(?i)\\\.gradle(?:\\|$)') { continue }
+                    Add-ScanTarget -Name ('白名单缓存：' + $name + ' ' + (Get-ScanProperty $target @('App') '')) `
+                        -LiteralPath $path -Category $slugs[$name] -Action delete -HandlerScript 'scripts/clean-cache.ps1' `
+                        -Estimate allocated-upper-bound -Priority 45 -Risk 1 `
+                        -Notes '按 targets.psd1 原用户白名单发现；估算为上限，执行时仍检查进程、年龄和排除子项。'
+                    $key = $path.TrimEnd('\').ToLowerInvariant()
+                    if ($script:ScanTargets.ContainsKey($key)) {
+                        $entry = $script:ScanTargets[$key]
+                        $entry | Add-Member -NotePropertyName RequiredProcesses -NotePropertyValue @(Get-ScanProperty $target @('ProcessNames') @()) -Force
+                        $entry | Add-Member -NotePropertyName CacheDefinition -NotePropertyValue $target -Force
+                        $entry | Add-Member -NotePropertyName CacheCategory -NotePropertyValue $name -Force
+                        $excluded = @(Get-ScanProperty $target @('ExcludeChildren') @())
+                        $entry.Details = [pscustomobject]@{ Scope = $target.Scope; FilePatterns = @(Get-ScanProperty $target @('FilePatterns') @())
+                            ExcludeChildren = $excluded; App = Get-ScanProperty $target @('App') }
+                        if ($excluded.Count -gt 0) {
+                            $entry.Notes += ' 计量仅覆盖未排除的子项。'
+                        }
+                    }
+                }
+            }
+            catch { Add-ScanIssue $name 'RegisteredCache' $_.Exception.Message }
+        }
+    }
+}
+
+function New-ScanInventoryEntry {
+    param([string]$Key, [string]$Name, [string]$Category, [string]$Path, $Bytes, $Details)
+    return [pscustomobject]@{
+        EntryKey = $Key; Name = $Name; Path = $Path; Category = $Category; Action = 'manual'; Risk = 2
+        HandlerScript = ''; HandlerParameters = @{}; ExecutionCommand = $null; Notes = '只读清单，必须人工检查。'
+        LogicalBytes = $Bytes; AllocatedBytes = $null; KnownLogicalBytes = $Bytes; KnownAllocatedBytes = $null
+        KnownSizeKind = 'unknown'; EstimatedReclaimableBytes = $null; EstimateKind = 'unknown'; Status = $(if ($null -eq $Bytes) { 'unknown' } else { 'ok' })
+        Skipped = @(); ReparsePoints = @(); ExcludedFromLocalTotals = $false; OverlapsOtherEntries = $false
+        Details = $Details; ManualEstimatedBytes = $Bytes
+    }
+}
+
+function Test-ScanInventoryPath {
+    param([string]$LiteralPath, [switch]$Root)
+    if ($LiteralPath -notmatch '^C:\\') { return $false }
+    foreach ($cloud in $script:ScanCloudRoots) {
+        if ($LiteralPath -ieq $cloud -or $LiteralPath.StartsWith($cloud + '\', [StringComparison]::OrdinalIgnoreCase)) { return $false }
+    }
+    $chain = Test-CleanerPathChain -LiteralPath $LiteralPath
+    if (-not $chain.IsSafe) { Add-ScanIssue $LiteralPath 'InventoryGuard' $chain.Reason; return $false }
+    $permitted = @()
+    if ($Root) { $permitted = @($script:ScanOriginalProfile) }
+    $reason = Get-CleanerForbiddenReason -LiteralPath $chain.Path -Context $context -PermittedContainerRoots $permitted
+    if ($reason) { return $false }
+    $boundary = Get-CleanerUserPathReason -LiteralPath $chain.Path -Context $context
+    if ($boundary) { Add-ScanIssue $LiteralPath 'InventoryGuard' $boundary; return $false }
+    return $true
+}
+
+function Get-ScanFileInventory {
+    param([string[]]$Roots, [switch]$Installers)
+    $status = 'ok'; $files = New-Object 'System.Collections.Generic.List[object]'
+    if ($Quick) { return [pscustomobject]@{ Status = 'skipped'; EstimatedBytes = $null; Files = @(); Examined = 0; Reason = '-Quick 跳过发现，大小未知。' } }
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    $queue = New-Object 'System.Collections.Generic.Queue[object]'
+    $seen = @{}; $examined = 0
+    foreach ($root in $Roots) { if ($root -match '^C:\\') { $queue.Enqueue([pscustomobject]@{ Path = $root; Depth = 0 }) } }
+    $appDataRoots = @(($script:ScanOriginalProfile.TrimEnd('\') + '\AppData'),
+        (Get-ScanProperty $context @('LocalAppData') ''), (Get-ScanProperty $context @('AppData') '')) | Where-Object { $_ }
+    $cutoff = [DateTime]::UtcNow.AddDays(-$InstallerAgeDays)
+    while ($queue.Count -gt 0 -and $watch.Elapsed.TotalSeconds -lt 20 -and $examined -lt 50000) {
+        $current = $queue.Dequeue()
+        if ($seen.ContainsKey($current.Path)) { continue }; $seen[$current.Path] = $true
+        $inAppData = $false
+        foreach ($appData in $appDataRoots) {
+            if ($current.Path -ieq $appData -or $current.Path.StartsWith($appData.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) { $inAppData = $true; break }
+        }
+        if (-not $Installers -and $inAppData) { continue }
+        if (-not (Test-ScanInventoryPath $current.Path -Root)) { $status = 'partial'; continue }
+        $guards = $null
+        try {
+            # 流式、逐级发现，不使用递归；时间/条目上限在每个条目前检查。
+            $guards = Open-CleanerParentGuards -LiteralPath ($current.Path.TrimEnd('\') + '\_scan_inventory_guard_')
+            foreach ($path in [IO.Directory]::EnumerateFileSystemEntries($current.Path)) {
+                if ($watch.Elapsed.TotalSeconds -ge 20 -or $examined -ge 50000) { $status = 'partial'; break }
+                $examined++
+                $inAppData = $false
+                foreach ($appData in $appDataRoots) {
+                    if ($path -ieq $appData -or $path.StartsWith($appData.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) { $inAppData = $true; break }
+                }
+                if (-not $Installers -and $inAppData) { continue }
+                if (-not (Test-ScanInventoryPath $path)) { $status = 'partial'; continue }
+                $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+                if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { $status = 'partial'; continue }
+                if ($item.PSIsContainer) {
+                    if ($current.Depth -lt 32) { $queue.Enqueue([pscustomobject]@{ Path = $item.FullName; Depth = $current.Depth + 1 }) }
+                    else { $status = 'partial' }
+                    continue
+                }
+                if ($Installers) {
+                    if ($item.Extension -notmatch '^(?i:\.exe|\.msi|\.msix|\.msixbundle|\.appx|\.iso|\.img|\.zip|\.7z|\.rar)$' -or $item.LastWriteTimeUtc -ge $cutoff) { continue }
+                }
+                elseif ($item.Length -lt ([long]$LargeFileMinMB * 1MB)) { continue }
+                $files.Add([pscustomobject]@{ Path = $item.FullName; LogicalBytes = [long]$item.Length; LastWriteTimeUtc = $item.LastWriteTimeUtc.ToString('o') })
+                if (-not $Installers -and $files.Count -gt [math]::Max(100, $LargeFileCount * 2)) {
+                    $largest = @($files | Sort-Object LogicalBytes -Descending | Select-Object -First $LargeFileCount)
+                    $files.Clear(); foreach ($file in $largest) { $files.Add($file) }
+                }
+            }
+        }
+        catch { $status = 'partial'; Add-ScanIssue $current.Path 'FileInventory' $_.Exception.Message }
+        finally { if ($null -ne $guards) { foreach ($handle in $guards.Handles) { $handle.Dispose() } } }
+    }
+    if ($queue.Count -gt 0 -or $watch.Elapsed.TotalSeconds -ge 20 -or $examined -ge 50000) {
+        $status = 'partial'; Add-ScanIssue ($Roots -join ';') 'InventoryLimit' '达到 20 秒、50000 条目或深度上限；发现不完整，已知文件仅为下限。'
+    }
+    $selected = @($files | Sort-Object @{ Expression = { $_.LogicalBytes }; Descending = $true }, Path)
+    if (-not $Installers) { $selected = @($selected | Select-Object -First $LargeFileCount) }
+    $aggregate = Get-ScanSizeAggregate $selected 'LogicalBytes' 'LogicalBytes'
+    $total = $aggregate.TotalBytes
+    if ($status -ne 'ok') { $total = $null }
+    return [pscustomobject]@{ Status = $status; EstimatedBytes = $total; KnownLowerBoundBytes = $aggregate.KnownLowerBoundBytes
+        Files = $selected; Examined = $examined; Reason = '逻辑大小，只用于人工审阅，不等同可释放空间；可能与其他清单重叠。' }
+}
+
+function Get-ScanInstalledSoftware {
+    param([string]$OriginalSid)
+    if ($Quick) { return [pscustomobject]@{ Status = 'skipped'; EstimatedBytes = $null; Items = @(); Reason = '-Quick 跳过软件清单，大小未知。' } }
+    $items = New-Object 'System.Collections.Generic.List[object]'
+    $status = 'ok'; $seen = @{}; $watch = [Diagnostics.Stopwatch]::StartNew(); $examined = 0
+    foreach ($hiveName in @('LocalMachine', 'Users')) {
+        foreach ($viewName in @('Registry64', 'Registry32')) {
+            $base = $null; $root = $null
+            $subkey = 'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'
+            if ($hiveName -eq 'Users') { $subkey = $OriginalSid + '\Software\Microsoft\Windows\CurrentVersion\Uninstall' }
+            try {
+                $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::$hiveName, [Microsoft.Win32.RegistryView]::$viewName)
+                $root = $base.OpenSubKey($subkey, $false)
+                if ($null -eq $root) { continue }
+                foreach ($name in $root.GetSubKeyNames()) {
+                    if ($watch.Elapsed.TotalSeconds -ge 15 -or $examined -ge 10000) { $status = 'partial'; break }
+                    $examined++; $key = $null
+                    try {
+                        $key = $root.OpenSubKey($name, $false)
+                        if ($null -eq $key) { throw '无法读取软件注册信息。' }
+                        $display = [string]$key.GetValue('DisplayName', '')
+                        if (-not $display -or $key.GetValue('SystemComponent', 0) -eq 1 -or $key.GetValue('ParentKeyName', '')) { continue }
+                        if ($display -match '(?i)Microsoft Visual C\+\+|Microsoft Windows Desktop Runtime|Microsoft ASP\.NET|\.NET.*(?:Runtime|运行时|Host|Targeting|Framework)|Windows.*(?:SDK|Software Development Kit)|Windows Software Development Kit|Windows Driver|\bDriver\b|\bDrivers\b|驱动') { continue }
+                        $location = ([string]$key.GetValue('InstallLocation', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)).Trim().Trim('"')
+                        if ($location) { $location = Expand-CleanerPath -Pattern $location -Context $context }
+                        if ($location -and $location -notmatch '^C:[\\/]') { continue }
+                        $sizeKB = $key.GetValue('EstimatedSize', $null)
+                        if (-not $location -and $null -eq $sizeKB) { continue }
+                        $bytes = $null
+                        if ($null -ne $sizeKB -and [double]$sizeKB -ge 0) { $bytes = [long]([double]$sizeKB * 1KB) }
+                        $identity = $display + '|' + $location
+                        if ($seen.ContainsKey($identity)) { continue }; $seen[$identity] = $true
+                        $items.Add([pscustomobject]@{ Name = $display; Path = $location; EstimatedBytes = $bytes; SizeKind = 'vendor-reported'
+                            LocationVerified = [bool]$location; RegistryKey = $hiveName + '\' + $subkey + '\' + $name })
+                    }
+                    catch { $status = 'partial'; Add-ScanIssue $name 'InstalledSoftware' $_.Exception.Message }
+                    finally { if ($null -ne $key) { $key.Dispose() } }
+                }
+            }
+            catch { $status = 'partial'; Add-ScanIssue $subkey 'InstalledSoftware' $_.Exception.Message }
+            finally { if ($null -ne $root) { $root.Dispose() }; if ($null -ne $base) { $base.Dispose() } }
+        }
+    }
+    if ($status -ne 'ok') { Add-ScanIssue 'Uninstall' 'InstalledSoftware' '软件清单不完整；厂商报告大小总量未知。' }
+    $known = [long]0; $unknown = $false
+    foreach ($item in $items) { if ($null -eq $item.EstimatedBytes) { $unknown = $true } else { $known += $item.EstimatedBytes } }
+    $total = $null
+    if ($status -eq 'ok' -and -not $unknown) { $total = $known }
+    return [pscustomobject]@{ Status = $status; EstimatedBytes = $total; KnownLowerBoundBytes = $known
+        Items = @($items | Sort-Object @{ Expression = { $_.EstimatedBytes }; Descending = $true }, Name)
+        Reason = '厂商 EstimatedSize（KB）报告，未声明安装位置的项目不能确认在 C:，不等同实际占用。' }
+}
+
+function Complete-ScanDiskLayout {
+    param($Layout, [object[]]$Partitions)
+    $system = @($Layout.Volumes | Where-Object { $_.DriveLetter -eq 'C' })
+    if ($system.Count -ne 1 -or $null -eq $system[0].DiskNumber) { throw '不能唯一确定 C: 的物理磁盘。' }
+    $Layout.SystemDiskNumber = $system[0].DiskNumber
+    $data = @($Layout.Volumes | Where-Object { $_.DriveLetter -and $_.DriveLetter -ne 'C' -and $_.DriveType -eq 'Fixed' })
+    $Layout.HasDataVolume = $data.Count -gt 0
+    if (@($data | Where-Object { $null -eq $_.DiskNumber }).Count -eq 0) {
+        $Layout.DataVolumesOnSystemDisk = ($data.Count -gt 0 -and @($data | Where-Object { $_.DiskNumber -ne $Layout.SystemDiskNumber }).Count -eq 0)
+    }
+    $Layout.SystemDiskPartitionCount = @($Partitions | Where-Object { $_.DiskNumber -eq $Layout.SystemDiskNumber }).Count
+    return $Layout
+}
+
+function Get-ScanDiskLayout {
+    $layout = [ordered]@{ Disks = $null; Volumes = $null; SystemDiskNumber = $null; HasDataVolume = $null
+        DataVolumesOnSystemDisk = $null; SystemDiskPartitionCount = $null }
+    if ($Quick) { return [pscustomobject]$layout }
+    try {
+        $disks = @(Get-Disk -ErrorAction Stop); $partitions = @(Get-Partition -ErrorAction Stop); $volumes = @(Get-Volume -ErrorAction Stop)
+        $layout.Disks = @($disks | ForEach-Object { [pscustomobject]@{ Number = $_.Number; FriendlyName = $_.FriendlyName
+            SizeBytes = $_.Size; BusType = [string]$_.BusType; MediaType = Get-ScanProperty $_ @('MediaType') } })
+        $layout.Volumes = @(foreach ($volume in $volumes) {
+            $matches = @($partitions | Where-Object { $_.DriveLetter -and $_.DriveLetter -eq $volume.DriveLetter })
+            $number = $null; if ($matches.Count -eq 1) { $number = $matches[0].DiskNumber }
+            [pscustomobject]@{ DriveLetter = [string]$volume.DriveLetter; FileSystem = $volume.FileSystem
+                SizeBytes = $volume.Size; FreeBytes = $volume.SizeRemaining; DiskNumber = $number; DriveType = [string]$volume.DriveType }
+        })
+        return Complete-ScanDiskLayout ([pscustomobject]$layout) $partitions
+    }
+    catch { Add-ScanIssue 'DiskLayout' 'StorageCmdlets' $_.Exception.Message }
+    try {
+        $disks = @(Get-CimInstance Win32_DiskDrive -ErrorAction Stop)
+        $partitions = @(Get-CimInstance Win32_DiskPartition -ErrorAction Stop)
+        $volumes = @(Get-CimInstance Win32_LogicalDisk -ErrorAction Stop)
+        $layout.Disks = @($disks | ForEach-Object { [pscustomobject]@{ Number = $_.Index; FriendlyName = $_.Model
+            SizeBytes = $_.Size; BusType = Get-ScanProperty $_ @('InterfaceType'); MediaType = Get-ScanProperty $_ @('MediaType') } })
+        $layout.Volumes = @(foreach ($volume in $volumes) {
+            $matches = @(Get-CimAssociatedInstance -InputObject $volume -Association Win32_LogicalDiskToPartition -ErrorAction Stop)
+            $number = $null; if ($matches.Count -eq 1) { $number = $matches[0].DiskIndex }
+            $type = [string]$volume.DriveType; if ($volume.DriveType -eq 3) { $type = 'Fixed' }
+            [pscustomobject]@{ DriveLetter = $volume.DeviceID.TrimEnd(':'); FileSystem = $volume.FileSystem
+                SizeBytes = $volume.Size; FreeBytes = $volume.FreeSpace; DiskNumber = $number; DriveType = $type }
+        })
+        $partitionData = @($partitions | ForEach-Object { [pscustomobject]@{ DiskNumber = $_.DiskIndex } })
+        return Complete-ScanDiskLayout ([pscustomobject]$layout) $partitionData
+    }
+    catch {
+        Add-ScanIssue 'DiskLayout' 'CimFallback' $_.Exception.Message
+        foreach ($key in @($layout.Keys)) { $layout[$key] = $null }
+        return [pscustomobject]$layout
+    }
+}
+
+function Get-ScanMigrationWhatIf {
+    param($Entry, $Context)
+    # 只为已经能核实准确 Item 的原用户数据生成演练行；不猜测发行版或源目录。
+    if (-not (Get-ScanProperty $Context @('OriginalUserVerified') $false)) { return $null }
+    $path = $Entry.Path.TrimEnd('\'); $parameters = $null; $safeCategory = ''
+    if ($Entry.Category -eq 'user-files') {
+        foreach ($folder in @($script:ScanKnownFolders.Keys | Sort-Object)) {
+            if ($path -ieq $script:ScanKnownFolders[$folder].TrimEnd('\')) {
+                $parameters = '-Item UserFolder -Folder ' + $folder + " -Destination 'D:\UserData\" + $folder + "' -VerifyHash"
+                $safeCategory = 'UserFolder'; break
+            }
+        }
+    }
+    elseif ($Entry.Category -in @('developer-cache', 'configured-development-data')) {
+        $cache = ''
+        if ($path -match '(?i)npm') { $cache = 'npm' }
+        elseif ($path -match '(?i)(^|\\)pip(\\|$)') { $cache = 'pip' }
+        elseif ($path -match '(?i)conda') { $cache = 'conda' }
+        elseif ($path -match '(?i)\\\.gradle(?:\\|$)') { $cache = 'gradle' }
+        elseif ($path -match '(?i)\\\.m2\\repository$') { $cache = 'maven' }
+        if ($cache) { $parameters = '-Item DevCache -Cache ' + $cache + " -Destination 'D:\DevCache\" + $cache + "'"; $safeCategory = 'DevCacheMigration' }
+    }
+    elseif ($Entry.Category -in @('chat-data', 'chat-attachments')) {
+        $app = ''; if ($path -match '(?i)\\(?:WeChat Files|xwechat_files)(?:\\|$)') { $app = 'WeChat' }
+        elseif ($path -match '(?i)\\Tencent Files(?:\\|$)') { $app = 'QQ' }
+        if ($app) {
+            $parameters = '-Item AppData -App ' + $app + " -Source '" + $path.Replace("'", "''") + "' -Destination 'D:\ChatData\" + $app + "' -VerifyHash"
+            $safeCategory = 'AppData'
+        }
+    }
+    elseif ($Entry.Category -eq 'wsl') {
+        $distro = [string](Get-ScanProperty $Entry.Details @('DistributionName') '')
+        if ($distro -and $distro -notin @('docker-desktop', 'docker-desktop-data')) {
+            $destinationName = [regex]::Replace($distro, '[^\w.-]', '_')
+            $parameters = "-Item WSL -Distro '" + $distro.Replace("'", "''") + "' -Destination 'D:\WSL\" + $destinationName + "' -VerifyHash"
+            $safeCategory = 'WSL'
+        }
+    }
+    if (-not $parameters) { return $null }
+    try {
+        $check = Test-SafeTarget -LiteralPath $path -Category $safeCategory -Context $Context
+        if (-not $check.IsSafe) { return $null }
+        return "& '.\scripts\migrate.ps1' " + $parameters + ' -WhatIf'
+    }
+    catch { return $null }
 }
 
 function ConvertTo-ScanBytes {
@@ -689,44 +1020,115 @@ function Set-ScanComponentStore {
     if ($null -eq $actual -or $null -eq $Entry.EstimatedReclaimableBytes) { $Entry.Status = 'partial' }
 }
 
+function Get-ScanVolumeReferenceKey {
+    param($Reference)
+    $text = [string](Get-ScanProperty $Reference @('DeviceID') $Reference)
+    $match = [regex]::Match($text, '(?i)Volume\{[0-9a-f-]{36}\}')
+    if (-not $match.Success) { throw '无法识别 VSS 卷引用。' }
+    return $match.Value.ToLowerInvariant()
+}
+
 function Set-ScanShadowStorage {
     param($Entry, [bool]$IsAdmin)
     $Entry.Status = 'unknown'
-    if (-not $IsAdmin) { $Entry.Notes += ' 非管理员：卷影存储量未知。'; return }
+    if (-not $IsAdmin) { $Entry.Notes += ' 非管理员：卷影存储量和关联未知。'; return }
     $query = Invoke-ScanQuery 'vssadmin.exe' @('list', 'shadowstorage', '/for=C:') '只读查询 C 盘卷影副本存储'
     $Entry.Status = $query.Status
     if ($query.Status -ne 'ok') { $Entry.Notes += ' ' + $query.Reason; return }
-    $records = New-Object 'System.Collections.Generic.List[object]'
-    $storageVolume = $null; $used = $null; $allocated = $null; $maximum = $null
-    foreach ($line in (($query.Output + "`nFor volume:") -split '\r?\n')) {
-        if ($line -match '(?i)^\s*(For volume|对于卷|针对卷)\s*[:：]') {
-            if ($null -ne $used -or $null -ne $storageVolume) {
-                $records.Add([pscustomobject]@{ StorageVolume = $storageVolume; UsedBytes = $used; AllocatedBytes = $allocated; MaximumBytes = $maximum })
-            }
-            $storageVolume = $null; $used = $null; $allocated = $null; $maximum = $null
+    try {
+        $volumes = @(Get-CimInstance -ClassName Win32_Volume -ErrorAction Stop)
+        $system = @($volumes | Where-Object { $_.DriveLetter -ieq 'C:' })
+        if ($system.Count -ne 1) { throw '无法唯一核实 C: 卷。' }
+        $systemKey = Get-ScanVolumeReferenceKey $system[0]
+        $records = @(foreach ($store in @(Get-CimInstance -ClassName Win32_ShadowStorage -ErrorAction Stop)) {
+            if ((Get-ScanVolumeReferenceKey $store.Volume) -ne $systemKey) { continue }
+            $onKey = Get-ScanVolumeReferenceKey $store.DiffVolume
+            $onVolumes = @($volumes | Where-Object { (Get-ScanVolumeReferenceKey $_) -eq $onKey })
+            if ($onVolumes.Count -ne 1) { throw '不能唯一核实卷影副本的实际存储卷。' }
+            $on = $onVolumes[0]
+            $onSpec = [string](Get-ScanProperty $on @('DriveLetter') '')
+            if ([string]::IsNullOrWhiteSpace($onSpec)) { $onSpec = [string](Get-ScanProperty $on @('DeviceID') '') }
+            if ([string]::IsNullOrWhiteSpace($onSpec)) { throw '实际存储卷没有可用的盘符或卷 GUID 路径。' }
+            [pscustomobject]@{ ForVolume = 'C:'; OnVolume = $onSpec; StorageVolume = $onSpec
+                UsedBytes = Get-ScanProperty $store @('UsedSpace'); AllocatedBytes = Get-ScanProperty $store @('AllocatedSpace')
+                MaximumBytes = Get-ScanProperty $store @('MaxSpace'); VolumeSizeBytes = Get-ScanProperty $on @('Capacity') }
+        })
+        $Entry.Details = [pscustomobject]@{ Associations = $records; RawOutput = $query.Output
+            AssociationResolved = $false; ForVolume = $null; OnVolume = $null; ProposedMaxSize = $null }
+        if ($records.Count -eq 0) {
+            $Entry.LogicalBytes = 0; $Entry.AllocatedBytes = 0; $Entry.EstimatedReclaimableBytes = 0
+            $Entry.EstimateKind = 'no-shadowstorage'; return
         }
-        if ($line -match '(?i)(Shadow Copy Storage volume|卷影副本存储卷)\s*[:：]\s*(.+)$') { $storageVolume = $matches[2].Trim() }
-        if ($line -match '(?i)(Used Shadow Copy Storage space|已使用的卷影副本存储空间|使用的卷影副本存储空间)\s*[:：]\s*(.+)$') { $used = ConvertTo-ScanBytes $matches[2] }
-        if ($line -match '(?i)(Allocated Shadow Copy Storage space|分配的卷影副本存储空间|已分配的卷影副本存储空间)\s*[:：]\s*(.+)$') { $allocated = ConvertTo-ScanBytes $matches[2] }
-        if ($line -match '(?i)(Maximum Shadow Copy Storage space|最大的卷影副本存储空间|最大卷影副本存储空间)\s*[:：]\s*(.+)$') { $maximum = ConvertTo-ScanBytes $matches[2] }
+        if ($records.Count -ne 1) { throw '存在多个关联，需人工选择，不生成调整选择器。' }
+        $record = $records[0]
+        if ($null -eq $record.AllocatedBytes -or $null -eq $record.VolumeSizeBytes -or
+            $null -eq $system[0].Capacity -or $record.AllocatedBytes -lt 320MB) {
+            throw '分配量或卷容量不明确，或低于安全建议的 320 MB 下限，不生成调整选择器。'
+        }
+        $limit = [math]::Min([double]$record.VolumeSizeBytes, [double]$system[0].Capacity) * 0.10
+        if ($limit -lt 320MB) { throw '卷容量不足以建议保守 VSS 上限，保持人工处理。' }
+        $maxSize = '10%'; $proposedBytes = $limit
+        if ($record.AllocatedBytes -lt $limit -or $record.VolumeSizeBytes -lt $system[0].Capacity) {
+            $megabytes = [long][math]::Floor([math]::Min($record.AllocatedBytes, $limit) / 1MB)
+            $maxSize = [string]$megabytes + 'MB'; $proposedBytes = $megabytes * 1MB
+        }
+        $Entry.Details.AssociationResolved = $true; $Entry.Details.ForVolume = 'C:'
+        $Entry.Details.OnVolume = $record.OnVolume; $Entry.Details.ProposedMaxSize = $maxSize
+        if ($record.OnVolume -ieq 'C:') {
+            $Entry.LogicalBytes = $record.UsedBytes; $Entry.AllocatedBytes = [long]$record.AllocatedBytes
+            $Entry.EstimatedReclaimableBytes = [long][math]::Max(0, $record.AllocatedBytes - $proposedBytes)
+            $Entry.EstimateKind = 'upper-bound'
+        }
+        else {
+            $Entry.LogicalBytes = 0; $Entry.AllocatedBytes = 0; $Entry.EstimatedReclaimableBytes = 0
+            $Entry.EstimateKind = 'stored-on-other-volume'
+        }
+        $Entry.Notes += ' 只建议现有关联的保守上限；并非删除整项，实际释放需执行后验证。'
     }
-    $Entry.Details = [pscustomobject]@{ Associations = @($records.ToArray()); RawOutput = $query.Output }
-    $localRecords = @($records | Where-Object { $_.StorageVolume -match '(?i)\(C:\)' })
-    if ($records.Count -gt 0 -and $localRecords.Count -gt 0 -and @($localRecords | Where-Object { $null -eq $_.UsedBytes -or $null -eq $_.AllocatedBytes }).Count -eq 0) {
-        $Entry.LogicalBytes = [long](($localRecords | Measure-Object UsedBytes -Sum).Sum)
-        $Entry.AllocatedBytes = [long](($localRecords | Measure-Object AllocatedBytes -Sum).Sum)
-        $Entry.EstimatedReclaimableBytes = $Entry.AllocatedBytes
-        $Entry.EstimateKind = 'upper-bound'
+    catch {
+        if ($null -ne $Entry.Details) { $Entry.Details.AssociationResolved = $false }
+        $Entry.Status = 'unknown'; $Entry.Notes += ' ' + $_.Exception.Message
+        Add-ScanIssue $Entry.Path 'ShadowAssociation' $_.Exception.Message
     }
-    elseif ($records.Count -gt 0 -and $localRecords.Count -eq 0 -and @($records | Where-Object { -not $_.StorageVolume -or $_.StorageVolume -notmatch '\([A-Za-z]:\)' }).Count -eq 0) {
-        $Entry.LogicalBytes = 0; $Entry.AllocatedBytes = 0; $Entry.EstimatedReclaimableBytes = 0
-        $Entry.EstimateKind = 'stored-on-other-volume'
+}
+
+function Measure-ScanCacheSelection {
+    param($Entry)
+    try {
+        $check = Test-SafeTarget -LiteralPath $Entry.Path -Category $Entry.CacheCategory -Context $context
+        if (-not $check.IsSafe) { throw $check.Reason }
+        $definition = $Entry.CacheDefinition
+        $selectedFiles = $definition.Scope -eq 'SelectedFiles'
+        $excluded = @(Get-ScanProperty $definition @('ExcludeChildren') @())
+        $sizes = New-Object 'System.Collections.Generic.List[object]'
+        foreach ($child in @(Get-CleanerChildren -LiteralPath $Entry.Path)) {
+            if ($child.Name -in $excluded) { continue }
+            if ($selectedFiles) {
+                if ($child.PSIsContainer) { continue }
+                $matched = $false
+                foreach ($pattern in @($definition.FilePatterns)) { if ($child.Name -like $pattern) { $matched = $true; break } }
+                if (-not $matched) { continue }
+            }
+            $size = Get-DirectorySize -LiteralPath $child.FullName
+            $sizes.Add([pscustomobject]@{ Path = $child.FullName; LogicalBytes = $size.LogicalBytes; AllocatedBytes = $size.AllocatedBytes
+                EstimatedReclaimableBytes = $size.EstimatedReclaimableBytes; KnownLogicalBytes = $size.KnownLogicalBytes
+                KnownAllocatedBytes = $size.KnownAllocatedBytes })
+            $Entry.Skipped += @($size.Skipped)
+            $Entry.ReparsePoints += @($size.ReparsePoints)
+        }
+        $logical = Get-ScanSizeAggregate @($sizes.ToArray()) 'LogicalBytes' 'KnownLogicalBytes'
+        $allocated = Get-ScanSizeAggregate @($sizes.ToArray()) 'AllocatedBytes' 'KnownAllocatedBytes'
+        $reclaimable = Get-ScanSizeAggregate @($sizes.ToArray())
+        $Entry.KnownLogicalBytes = $logical.KnownLowerBoundBytes; $Entry.KnownAllocatedBytes = $allocated.KnownLowerBoundBytes
+        if ($Entry.Skipped.Count -gt 0 -or $null -eq $logical.TotalBytes -or $null -eq $allocated.TotalBytes) {
+            $Entry.Status = 'partial'; $Entry.KnownSizeKind = 'lower-bound'; return
+        }
+        $Entry.LogicalBytes = $logical.TotalBytes; $Entry.AllocatedBytes = $allocated.TotalBytes
+        $Entry.EstimatedReclaimableBytes = $reclaimable.TotalBytes; $Entry.EstimateKind = 'upper-bound'
+        $Entry.Status = 'ok'; $Entry.KnownSizeKind = 'complete'
+        $Entry.Notes += ' 大小仅限白名单文件名/未排除子项，不是整个目录；实际清理还受年龄和占用限制。'
     }
-    elseif ($query.Output -match '(?i)No items found|找不到任何项目|未找到任何项目|没有找到任何项目') {
-        $Entry.LogicalBytes = 0; $Entry.AllocatedBytes = 0; $Entry.EstimatedReclaimableBytes = 0
-        $Entry.EstimateKind = 'no-shadowstorage'
-    }
-    else { $Entry.Status = 'unknown'; $Entry.Notes += ' 当前语言/输出无法可靠解析；请查看 Details.RawOutput，未知不记为零。' }
+    catch { $Entry.Status = 'unknown'; $Entry.Skipped += $_.Exception.Message; Add-ScanIssue $Entry.Path 'CacheSelection' $_.Exception.Message }
 }
 
 function Measure-ScanEntry {
@@ -759,6 +1161,10 @@ function Measure-ScanEntry {
         $Entry.Status = 'skipped'
         $Entry.Notes += ' 已跳过递归大小统计。'
         return
+    }
+    $definition = Get-ScanProperty $Entry @('CacheDefinition')
+    if ($null -ne $definition -and ($definition.Scope -eq 'SelectedFiles' -or @(Get-ScanProperty $definition @('ExcludeChildren') @()).Count -gt 0)) {
+        Measure-ScanCacheSelection $Entry; return
     }
     try {
         $size = Get-DirectorySize -LiteralPath $Entry.Path
@@ -820,15 +1226,281 @@ function Format-ScanSize {
     return Format-ScanBytes $Bytes
 }
 
+# 以下分类、聚合和建议函数只处理输入数据，可从 AST 提取后跨平台测试。
+function Get-ScanDispositionRules {
+    $rules = @{}
+    # Key、标题、影响、数据损失、管理员、风险、需关闭程序、重启、附带影响。
+    $rows = @(
+        @('UserTemp', '用户临时文件', '清除闲置临时文件，应用需要时会重新生成。', 'regenerable', $false, 'low', @(), $false, @('近期或占用文件会跳过。')),
+        @('WindowsTemp', 'Windows 临时文件', '清除系统临时文件，正在使用或更新中的项目会跳过。', 'regenerable', $true, 'low', @(), $false, @('安装或更新活动、待重启或状态不明时跳过。')),
+        @('ThumbnailCache', '缩略图缓存', '清除缩略图缓存，下次打开文件夹时会重新生成预览。', 'regenerable', $false, 'low', @('explorer'), $false, @('首次显示缩略图可能较慢。')),
+        @('BrowserCache', '浏览器缓存', '清除浏览器网页缓存，书签和密码保留但页面需重新下载。', 'regenerable', $false, 'low', @('所有相关浏览器'), $false, @('首次访问网页可能较慢并消耗流量。')),
+        @('DevCache', '开发工具缓存', '由官方工具清理可再下载的包缓存，下次构建可能需要联网下载。', 'regenerable', $false, 'medium', @('开发工具、构建和包管理进程'), $false, @('离线构建可能失败；配置不符或工具不可用时跳过。')),
+        @('AppCache', '应用缓存', '清除白名单应用缓存，应用下次启动时会重新生成或下载。', 'regenerable', $false, 'low', @('相关应用'), $false, @('首次启动或加载可能较慢。')),
+        @('ShaderCache', '着色器缓存', '清除着色器缓存，游戏和图形应用会重新编译着色器。', 'regenerable', $false, 'low', @('游戏和图形应用'), $false, @('首次启动可能出现短暂卡顿。')),
+        @('InetCache', 'Internet 临时缓存', '清除 Internet 临时缓存，相关页面和应用资源需重新下载。', 'regenerable', $false, 'low', @('浏览器和使用 Internet 缓存的应用'), $false, @('离线网页资源可能需要重新下载。')),
+        @('SystemLogs', '系统日志缓存', '清除白名单内的旧日志，将失去这些日志的历史排障信息但系统会继续生成新日志。', 'regenerable', $true, 'medium', @(), $false, @('历史日志不能重建；新的日志会继续生成。')),
+        @('ComponentStore', 'Windows 组件存储', '通过 DISM 清理已替代组件，保留当前系统组件且不使用 ResetBase。', 'regenerable', $true, 'medium', @(), $false, @('操作耗时，执行器会重新分析清理价值。')),
+        @('UpdateCache', 'Windows 更新下载缓存', '清除更新下载缓存，后续更新需要时会重新下载。', 'regenerable', $true, 'medium', @(), $false, @('暂时停止并恢复更新服务；更新活动或待重启时跳过。')),
+        @('DeliveryOptimization', '传递优化缓存', '清除传递优化下载缓存，更新资源可能需要重新下载。', 'regenerable', $true, 'low', @(), $false, @('更新活动或状态不明时跳过。')),
+        @('RecycleBin', '原用户回收站', '永久清空原用户 C 盘回收站，内容无法从回收站恢复。', 'irreversible', $true, 'high', @(), $false, @('只处理已核实的原用户，不处理其他用户回收站。')),
+        @('CrashDumps', '崩溃转储和错误报告', '永久清除崩溃转储和错误报告，将失去对应故障诊断现场。', 'irreversible', $true, 'high', @(), $false, @('正在排障时请先备份转储。')),
+        @('WindowsOld', '旧系统 Windows.old', '清理旧系统后将失去相应版本回退能力和其中未备份的数据。', 'irreversible', $true, 'high', @(), $false, @('先检查旧用户文件并备份。')),
+        @('Hibernate', '休眠文件精简模式', '改为 Reduced 后保留快速启动，但不能完整休眠或使用混合睡眠。', 'irreversible', $true, 'medium', @(), $false, @('可恢复完整休眠配置，精简前的休眠状态不能恢复；实际释放量未知。')),
+        @('ShadowStorage', '卷影副本存储上限', '缩小已核实关联的 VSS 上限可能立即永久删除旧快照和还原点。', 'irreversible', $true, 'high', @(), $false, @('丢失的旧快照和还原点不可恢复；上限不代表保证收益。'))
+    )
+    foreach ($row in $rows) {
+        $rules[$row[0]] = @{ Disposition = 'ai'; Title = $row[1]; Summary = $row[2]; DataLoss = $row[3]
+            RequiresAdmin = $row[4]; RiskLevel = $row[5]; RequiresClosedApps = $row[6]
+            RequiresRestart = $row[7]; SideEffects = $row[8]; Reason = ''; Steps = @() }
+    }
+    $manualRows = @(
+        @('user-files', '用户文件夹需要核对目标容量并切换系统位置。', @('在资源管理器打开此文件夹，检查重要文件并备份到另一物理磁盘或云端。', '确认 D: 是可用的数据卷且空间充足；右键文件夹→属性→位置→移动，选择 D:\UserData 下对应文件夹。', '打开迁移后的文件验证可读，再到设置→系统→存储→更改新内容的保存位置选择数据卷；保留旧副本直到备份验证完成。')),
+        @('cloud-onedrive', '同步文件删除会传播到云端，必须由客户端释放本地副本。', @('打开同步客户端，确认同步完成且无错误，并在网页端抽查文件可下载。', '在资源管理器中右键已同步文件夹→OneDrive→释放空间，其他同步软件选择“仅在线”。', '确认文件出现云朵图标；抽查仍可下载，离线需要的文件选择“始终保留在此设备上”。')),
+        @('virtual-disk', '虚拟磁盘需要先备份并退出虚拟机，再按所属软件流程迁移或压缩。', @('打开虚拟机、WSL 或 Docker，核对磁盘所属实例，并把重要数据备份到另一物理磁盘。', 'Docker Desktop：设置→Resources→Advanced→Disk image location 选择数据卷；WSL 先运行 wsl --list --verbose 核对发行版名称。', '退出 Docker 和虚拟机；WSL 在保存工作后运行 wsl --shutdown；使用所属软件支持的导出、迁移或压缩功能，禁止直接删除 VHD/VHDX。', '重新启动实例，验证用户、业务文件、容器及卷；比较 C: 空闲变化并保留原磁盘和备份。')),
+        @('pagefile', '页面文件影响提交上限和崩溃转储，默认保持系统管理。', @('运行 SystemPropertiesAdvanced.exe→性能“设置”→高级→虚拟内存“更改”，记录当前系统管理配置。', '仅在确认内存、峰值提交量和崩溃转储需求后由管理员评估其他卷配置；不要删除 pagefile.sys 或 swapfile.sys。', '如人工变更，按界面提示重启，检查任务管理器→性能→内存→已提交及事件查看器；异常时恢复原配置。')),
+        @('shadowstorage-manual', '实际 VSS 关联或可用上限未可靠解析，不能猜测存储卷。', @('以管理员身份打开终端，运行 vssadmin list shadowstorage /for=C:，核对“对于卷”和“卷影副本存储卷”。', '运行 Get-CimInstance Win32_ShadowStorage 和 Get-CimInstance Win32_Volume 交叉核对关联与容量；关联不明确时保留。', '确认独立备份可恢复并重新完整扫描；只有关联解析成功后才能单独确认 A 区项，缩小会永久丢失旧快照和还原点。')),
+        @('reserved-storage', '保留存储服务于系统更新，默认保留，禁用也不保证立即释放。', @('以管理员身份打开终端，运行 DISM /Online /Get-ReservedStorageState 查看状态。', '打开设置→系统→存储→显示更多类别→系统和保留空间，核对实际占用；优先清理其他可确认项。', '保留默认设置；如确需调整，先完成系统备份并由管理员查阅适用 Windows 版本的官方流程，更新后验证可用空间。')),
+        @('large-file', '大文件可能是唯一副本，需要逐个判断保留、移动或自行删除。', @('在资源管理器定位此文件，核对用途、修改时间和是否有另一物理磁盘上的备份。', '需要保留时复制到 D:\UserData 的专用目录，打开并核对大小，重要文件比较 Get-FileHash；验证后再决定是否删除 C: 旧副本。', '确认无用时在资源管理器自行删除；需要离线使用或无法判断时保留。')),
+        @('old-installers', '旧安装包和归档可能仍有安装或恢复用途，必须逐个检查。', @('在资源管理器打开列出的下载和桌面目录，切换“详细信息”，按修改日期和大小排序，逐个核对下方文件清单。', '确认可重新下载或内容已有备份后，自行选择无用安装包/归档删除；需保留的复制到 D:\Installers 并打开验证。', '保留唯一安装介质、授权文件和重要归档；验证备份后再处理 C: 旧副本，不要批量清空下载或桌面。')),
+        @('installed-software', '软件大小由厂商报告，卸载影响应用及其数据，需先核对备份。', @('打开设置→应用→已安装的应用（Windows 10 为“应用和功能”），按名称找到此软件并核对大小和用途。', '先导出设置和重要数据；选择“卸载”，或仅在应用提供“移动”按钮/官方库移动功能时使用它。', '需要继续使用时重新安装，在安装器允许时选择 D:\Apps 下的专用目录，再验证应用和数据；Program Files 绝不能靠复制目录移动。')),
+        @('developer-cache', '开发缓存迁移涉及工具配置，不能直接删除整个仓库。', @('关闭 IDE 和构建任务，运行对应工具的配置查询确认实际缓存位置，并备份本机独有包和构建产物。', '在工具设置中把未来缓存位置改到 D:\DevCache 下的专用目录；只改配置不会移动或释放现有缓存。', '执行一次下载/构建，检查新路径和离线需求；旧数据在核验备份和工具清理范围前保留。')),
+        @('chat-data', '聊天记录和附件可能只有一份，需要软件内备份和位置切换。', @('打开微信/QQ→设置→文件管理或存储管理，核对当前路径和版本，使用应用内备份功能备份聊天记录。', '关闭应用后复制并校验受支持的文件数据；在应用设置中将存储位置切换到 D:\ChatData 的专用目录。', '重新打开应用，抽查近期和旧记录、图片、视频和附件；保留原目录及独立备份，不把聊天库当缓存删除。')),
+        @('manual', '没有可覆盖整项的安全执行选择器，需要使用系统或应用界面逐步处理。', @('在资源管理器或软件设置中核对列出的路径、内容用途和占用，无法判断的数据保留。', '打开所属软件的存储/缓存设置，使用官方清理或位置迁移功能；系统项在设置→系统→存储→临时文件中核对，未列出的项目保留。', '处理前备份重要数据，完成后重开应用验证功能，并比较 C: 空闲空间；禁止直接递归删除系统或软件安装目录。')),
+        @('migrate', '迁移需要确认目标、复制校验和应用切换，每步都需人工验证。', @('在所属软件设置中核对数据路径，关闭写入并备份到另一物理磁盘或云端，确认 D: 的容量和文件系统。', '使用软件自带的存储位置、游戏库移动或导出/导入功能，选择 D: 的专用目录；先复制并校验，保留旧源。', '切换后启动软件并抽查数据，验证独立备份可恢复后才另行决定旧源处理；迁移本身不等于已释放空间。'))
+    )
+    foreach ($row in $manualRows) {
+        $rules[$row[0]] = @{ Disposition = 'manual'; Title = ''; Summary = '需要人工核对用途和备份后逐步处理，保留旧副本直到验证完成。'
+            DataLoss = 'none'; RequiresAdmin = ($row[0] -in @('pagefile', 'reserved-storage')); RiskLevel = 'medium'
+            RequiresClosedApps = @(); RequiresRestart = ($row[0] -eq 'pagefile'); SideEffects = @('人工操作前核对备份及完整作用范围。')
+            Reason = $row[1]; Steps = $row[2] }
+    }
+    $rules['keep'] = @{ Disposition = 'keep'; Title = ''; Summary = '此项仅报告或保留，不获得清理或迁移授权。'
+        DataLoss = 'none'; RequiresAdmin = $false; RiskLevel = 'low'; RequiresClosedApps = @(); RequiresRestart = $false
+        SideEffects = @(); Reason = ''; Steps = @() }
+    return $rules
+}
+
+function Get-ScanDisposition {
+    param($Entry)
+    $rules = Get-ScanDispositionRules
+    $category = [string](Get-ScanProperty $Entry @('Category') '')
+    $action = [string](Get-ScanProperty $Entry @('Action') 'keep')
+    $parameters = Get-ScanProperty $Entry @('HandlerParameters') @{}
+    $selector = [string](Get-ScanProperty $parameters @('Category', 'Action') '')
+    $key = 'keep'
+    $blocked = [bool](Get-ScanProperty $Entry @('SafetyBlocked') $false) -or
+        (Get-ScanProperty $Entry @('Status') '') -in @('not-found', 'reparse-point')
+    $rootReparse = @(Get-ScanProperty $Entry @('ReparsePoints') @() | Where-Object {
+        [string](Get-ScanProperty $_ @('Path', 'LiteralPath') $_) -ieq [string](Get-ScanProperty $Entry @('Path') '')
+    }).Count -gt 0
+    $blocked = $blocked -or $rootReparse
+    $cloud = $category -in @('cloud-onedrive', 'cloud-sync')
+    if (-not $blocked -and (-not (Get-ScanProperty $Entry @('ExcludedFromLocalTotals') $false) -or $cloud)) {
+        if ($cloud) { $key = 'cloud-onedrive' }
+        elseif ($category -match 'summary$' -or $category -eq 'protected') { $key = 'keep' }
+        elseif ($category -in @('pagefile', 'reserved-storage')) { $key = $category }
+        elseif ($action -eq 'migrate') { $key = 'migrate' }
+        elseif ($selector -and $rules.ContainsKey($selector) -and $rules[$selector].Disposition -eq 'ai' -and
+            (Get-ScanProperty $Entry @('HandlerScript') '') -in @('scripts/clean-cache.ps1', 'scripts/clean-system.ps1')) {
+            $key = $selector
+            if ($selector -eq 'Hibernate' -and (Get-ScanProperty $parameters @('Mode') '') -ne 'Reduced') { $key = 'manual' }
+            if ($selector -eq 'RecycleBin' -and -not (Get-ScanProperty $Entry @('OriginalUserOnly') $false)) { $key = 'keep' }
+            if ($selector -eq 'ShadowStorage' -and -not (Get-ScanProperty (Get-ScanProperty $Entry @('Details')) @('AssociationResolved') $false)) { $key = 'manual' }
+        }
+        elseif ($action -ne 'keep') { $key = 'manual' }
+        if ($key -in @('migrate', 'manual')) {
+            if ($category -eq 'shadowstorage') { $key = 'shadowstorage-manual' }
+            elseif ($category -match 'vhdx|vdisk|^wsl$|^docker-data$') { $key = 'virtual-disk' }
+            elseif ($category -in @('chat-data', 'chat-attachments', 'chat-history')) { $key = 'chat-data' }
+            elseif ($rules.ContainsKey($category) -and $rules[$category].Disposition -eq 'manual') { $key = $category }
+        }
+    }
+    $rule = $rules[$key]
+    $steps = @(); $index = 0
+    foreach ($step in @($rule.Steps)) { $index++; $steps += ('{0}. {1}' -f $index, $step) }
+    $migrationCommand = Get-ScanProperty $Entry @('MigrationWhatIf')
+    if ($rule.Disposition -eq 'manual' -and $migrationCommand) {
+        $steps = @('1. 确认数据卷容量并备份到另一物理磁盘；在 skill 根目录打开原用户 PowerShell，先演练：' + $migrationCommand)
+        $index = 1
+        foreach ($step in @($rule.Steps)) { $index++; $steps += ('{0}. {1}' -f $index, $step) }
+    }
+    if ($rule.Disposition -eq 'manual' -and $category -eq 'old-installers') {
+        $fileList = @(Get-ScanProperty (Get-ScanProperty $Entry @('Details')) @('Files') @())
+        if ($fileList.Count -gt 0) {
+            $index++
+            $lines = @($fileList | ForEach-Object { $_.Path + '（逻辑大小 ' + [string]$_.LogicalBytes + ' 字节）' })
+            $steps += ('{0}. 优先审阅最大的 20 个候选文件（最多列 20 个）：{1}{2}' -f $index, [Environment]::NewLine, ($lines -join [Environment]::NewLine))
+        }
+    }
+    $closed = @($rule.RequiresClosedApps) + @(Get-ScanProperty $Entry @('RequiredProcesses') @())
+    $irreversible = $rule.DataLoss -eq 'irreversible'
+    return [pscustomobject]@{
+        Disposition = $rule.Disposition; DefaultSelected = ($rule.Disposition -eq 'ai' -and -not $irreversible)
+        Irreversible = $irreversible; Title = $rule.Title
+        Impact = [pscustomobject]@{ Summary = $rule.Summary; DataLoss = $rule.DataLoss; Reversible = (-not $irreversible)
+            RequiresClosedApps = @($closed | Sort-Object -Unique); RequiresRestart = [bool]$rule.RequiresRestart
+            RequiresAdmin = [bool]$rule.RequiresAdmin; RiskLevel = $rule.RiskLevel; SideEffects = @($rule.SideEffects) }
+        ManualReason = $rule.Reason; ManualSteps = @($steps)
+    }
+}
+
+function Get-ScanSizeAggregate {
+    param([object[]]$Entries, [string]$SizeProperty = 'EstimatedReclaimableBytes', [string]$LowerBoundProperty = 'KnownAllocatedBytes')
+    $roots = New-Object 'System.Collections.Generic.List[object]'
+    $unknown = $false; [long]$total = 0; [long]$known = 0
+    foreach ($entry in $Entries) {
+        if ($null -eq (Get-ScanProperty $entry @($SizeProperty))) { $unknown = $true }
+    }
+    foreach ($entry in @($Entries | Sort-Object @{ Expression = { ([string](Get-ScanProperty $_ @('Path') '')).Length } }, Path)) {
+        $path = ([string](Get-ScanProperty $entry @('Path') '')).Replace('/', '\').TrimEnd('\')
+        $overlap = $false
+        foreach ($root in $roots) {
+            if ($path -ieq $root.Path -or ($root.Path -and $path.StartsWith($root.Path + '\', [StringComparison]::OrdinalIgnoreCase))) { $overlap = $true; break }
+        }
+        if ($overlap) { continue }
+        $roots.Add([pscustomobject]@{ Path = $path })
+        $size = Get-ScanProperty $entry @($SizeProperty)
+        if ($null -ne $size) { $total += [long]$size; $known += [long]$size }
+        else { $lower = Get-ScanProperty $entry @($LowerBoundProperty); if ($null -ne $lower) { $known += [long]$lower } }
+    }
+    $reported = $null
+    if (-not $unknown) { $reported = $total }
+    return [pscustomobject]@{ TotalBytes = $reported; KnownLowerBoundBytes = $known }
+}
+
+function Merge-ScanImpact {
+    param([object[]]$Impacts)
+    $loss = 'none'; $risk = 'low'; $admin = $false; $restart = $false; $reversible = $true
+    $ranks = @{ none = 0; regenerable = 1; irreversible = 2; low = 0; medium = 1; high = 2 }
+    foreach ($impact in $Impacts) {
+        if ($ranks[$impact.DataLoss] -gt $ranks[$loss]) { $loss = $impact.DataLoss }
+        if ($ranks[$impact.RiskLevel] -gt $ranks[$risk]) { $risk = $impact.RiskLevel }
+        $admin = $admin -or $impact.RequiresAdmin; $restart = $restart -or $impact.RequiresRestart
+        $reversible = $reversible -and $impact.Reversible
+    }
+    return [pscustomobject]@{ Summary = (@($Impacts | ForEach-Object { $_.Summary } | Select-Object -Unique) -join ' ')
+        DataLoss = $loss; Reversible = $reversible; RequiresClosedApps = @($Impacts | ForEach-Object { $_.RequiresClosedApps } | Sort-Object -Unique)
+        RequiresRestart = $restart; RequiresAdmin = $admin; RiskLevel = $risk
+        SideEffects = @($Impacts | ForEach-Object { $_.SideEffects } | Select-Object -Unique) }
+}
+
+function Get-ScanConfirmationItems {
+    param([object[]]$Entries)
+    $groups = @{}
+    foreach ($entry in @($Entries | Where-Object { $_.Disposition -eq 'ai' })) {
+        $parameters = Get-ScanProperty $entry @('HandlerParameters') @{}
+        $pairs = @($parameters.Keys | Sort-Object | ForEach-Object { @($_, $parameters[$_]) | ConvertTo-Json -Compress -Depth 8 })
+        $key = $entry.HandlerScript + '|' + ($pairs -join '|')
+        if (-not $groups.ContainsKey($key)) { $groups[$key] = New-Object 'System.Collections.Generic.List[object]' }
+        $groups[$key].Add($entry)
+    }
+    $items = @(foreach ($key in @($groups.Keys | Sort-Object)) {
+        $members = @($groups[$key].ToArray()); $first = $members[0]
+        $aggregate = Get-ScanSizeAggregate $members
+        $impact = Merge-ScanImpact @($members | ForEach-Object { $_.Impact })
+        $classification = Get-ScanDisposition $first
+        [pscustomobject]@{ Id = 0; Title = $classification.Title; HandlerScript = $first.HandlerScript
+            HandlerParameters = $first.HandlerParameters; ExecutionCommand = $first.ExecutionCommand
+            Paths = @($members.Path | Sort-Object -Unique); EstimatedReclaimableBytes = $aggregate.TotalBytes
+            KnownLowerBoundBytes = $aggregate.KnownLowerBoundBytes
+            DefaultSelected = ($impact.DataLoss -ne 'irreversible' -and @($members | Where-Object { -not $_.DefaultSelected }).Count -eq 0)
+            Irreversible = ($impact.DataLoss -eq 'irreversible'); RequiresAdmin = $impact.RequiresAdmin; Impact = $impact
+            EntryKeys = @($members | ForEach-Object { $_.EntryKey } | Sort-Object -Unique) }
+    })
+    $id = 0
+    foreach ($item in @($items | Sort-Object @{ Expression = { $_.Irreversible } },
+        @{ Expression = { $null -eq $_.EstimatedReclaimableBytes } },
+        @{ Expression = { $_.EstimatedReclaimableBytes }; Descending = $true }, Title)) {
+        $id++; $item.Id = $id; $item
+    }
+}
+
+function Get-ScanManualSize {
+    param($Entry)
+    if ((Get-ScanProperty $Entry @('Status') '') -in @('partial', 'unknown', 'skipped', 'reparse-point', 'not-found', 'cloud-excluded')) { return $null }
+    return Get-ScanProperty $Entry @('ManualEstimatedBytes', 'AllocatedBytes', 'LogicalBytes')
+}
+
+function Get-ScanManualItems {
+    param([object[]]$Entries)
+    $id = 0
+    foreach ($entry in @($Entries | Where-Object { $_.Disposition -eq 'manual' } | Sort-Object `
+        @{ Expression = { $null -eq (Get-ScanManualSize $_) } },
+        @{ Expression = { Get-ScanManualSize $_ }; Descending = $true }, Name, EntryKey)) {
+        $id++
+        [pscustomobject]@{ Id = 'M' + $id; Title = $entry.Name; Reason = $entry.ManualReason + $(if ($entry.Category -eq 'installed-software') { ' 大小为厂商报告；未声明位置时不能确认在 C:。' }); Steps = @($entry.ManualSteps)
+            EstimatedBytes = Get-ScanManualSize $entry
+            Paths = @(Get-ScanProperty $entry.Details @('Paths') @($entry.Path) | Where-Object { $_ }); Category = $entry.Category }
+    }
+}
+
+function Get-ScanAdvisory {
+    param($Baseline, $DiskLayout, $StorageSenseEnabled, $Evidence)
+    $advice = New-Object 'System.Collections.Generic.List[object]'
+    $free = Get-ScanProperty $Baseline @('FreeBytes'); $total = Get-ScanProperty $Baseline @('TotalBytes')
+    if ($null -ne $free -and ($free -lt 20GB -or ($null -ne $total -and $total -gt 0 -and $free / $total -lt 0.10))) {
+        $advice.Add([pscustomobject]@{ Id = 'low-space'; Severity = 'critical'; Title = 'C 盘空间告急'
+            Detail = 'C: 可用空间低于 20 GB 或总容量的 10%，可能影响更新和应用运行。'; Steps = @('先确认 A 区影响明确的项目，完成后重新扫描比较空闲空间。', '将可迁移的个人数据安排到数据卷，给系统和更新预留空间。') })
+    }
+    $hasData = Get-ScanProperty $DiskLayout @('HasDataVolume')
+    if ($null -ne $hasData -and -not $hasData) {
+        $advice.Add([pscustomobject]@{ Id = 'no-data-volume'; Severity = 'warn'; Title = '为系统之外的数据准备数据卷'
+            Detail = '已确认没有固定数据卷；C 盘只放系统和必须装在系统盘的程序，个人数据应放到数据卷。'
+            Steps = @('优先增加第二块物理磁盘作为数据盘，避免长期只依赖一个分区或一块磁盘。', '如需在现有磁盘分区，先完成独立备份并验证可恢复，再由人工在磁盘管理中评估压缩 C: 和新建数据分区；本 skill 不执行分区操作。') })
+    }
+    if ($hasData -eq $true -and (Get-ScanProperty $DiskLayout @('DataVolumesOnSystemDisk')) -eq $true) {
+        $advice.Add([pscustomobject]@{ Id = 'same-disk-backup'; Severity = 'warn'; Title = '同一磁盘的分区不能作为独立备份'
+            Detail = '已确认数据卷都在系统磁盘上，分区便于整理，但物理磁盘故障会同时影响 C: 和数据卷。'
+            Steps = @('日常数据可放 D:，备份另存第二块物理磁盘、外置磁盘或云端。', '定期抽查备份并进行恢复验证，不把同盘复制当成独立备份。') })
+    }
+    $rows = @(
+        @('UserFolderBytes', 10GB, 'user-folders', '个人文件移出系统盘', '桌面、文档、下载、图片和视频在 C: 上的已知占用超过 10 GB。', @('先备份并核对数据卷容量，通过文件夹属性→位置→移动到 D:\UserData。', '在设置→系统→存储→更改新内容的保存位置中选择数据卷。')),
+        @('DevelopmentBytes', 5GB, 'development', '开发数据和虚拟磁盘安排到数据卷', '开发缓存、WSL 或虚拟磁盘在 C: 上的已知占用超过 5 GB。', @('按 B 区的 migrate.ps1 -WhatIf 命令逐步演练并验证；WSL 使用导出/导入，Docker 使用官方磁盘位置设置。', '开发缓存可先用 migrate.ps1 -Item DevCache 只改未来缓存配置；配置变更不会搬走旧缓存。')),
+        @('InstalledSoftwareBytes', 20GB, 'software-placement', '今后安装软件优先选择数据卷', 'C: 软件的厂商报告大小合计超过 20 GB，实际占用可能不同。', @('新装普通应用时选择 D:\Apps 的专用目录；驱动和系统工具保留官方默认位置。', '现有应用通过卸载重装或官方移动功能迁移，绝不复制移动 Program Files。')),
+        @('HibernationBytes', 8GB, 'hibernate-reduced', '评估精简休眠文件', '休眠文件已知大小超过 8 GB，可评估 A 区的 Hibernate Reduced 选项。', @('如不使用完整休眠或混合睡眠，单独点名确认 Reduced；它保留快速启动。', '变更后验证快速启动和电源功能；如需要完整休眠，请保留原设置。'))
+    )
+    foreach ($row in $rows) {
+        $bytes = Get-ScanProperty $Evidence @($row[0])
+        if ($null -ne $bytes -and $bytes -gt $row[1]) {
+            $advice.Add([pscustomobject]@{ Id = $row[2]; Severity = 'info'; Title = $row[3]; Detail = $row[4]; Steps = $row[5] })
+        }
+    }
+    if ($null -ne $StorageSenseEnabled -and $StorageSenseEnabled -eq $false) {
+        $advice.Add([pscustomobject]@{ Id = 'storage-sense'; Severity = 'info'; Title = '启用存储感知定期维护'
+            Detail = '原用户存储感知已关闭；开启后可按配置清理临时文件和过期回收站内容，下载及云文件策略需要单独核对。'
+            Steps = @('打开设置→系统→存储→存储感知并启用，设置运行频率。', '核对回收站保留天数；下载文件夹按需保留，云文件仅在确认可取回后设置仅在线策略。') })
+    }
+    return $advice.ToArray()
+}
+
 function Get-ScanRecommendation {
     param($Entry, $Context)
     # 选择器只用于已实现的清理范围。迁移仍需用户选择目标、工具和具体数据，
     # 不把泛化的 migrate.ps1 链接伪装成可以直接执行的命令。
     $result = [pscustomobject]@{
         Action = $Entry.Action; HandlerScript = ''; HandlerParameters = @{}
-        ExecutionCommand = $null; Notes = $Entry.Notes
+        ExecutionCommand = $null; Notes = $Entry.Notes; SafetyBlocked = $false
     }
     if ($Entry.Action -eq 'keep') { return $result }
+    if ($Entry.Category -match 'summary$') { $result.Action = 'keep'; return $result }
+    if ($Entry.Category -eq 'shadowstorage') {
+        $details = $Entry.Details
+        if (-not (Get-ScanProperty $details @('AssociationResolved') $false)) { $result.Action = 'manual'; return $result }
+        $result.HandlerScript = 'scripts/clean-system.ps1'; $result.Action = 'system-tool'
+        $result.HandlerParameters = @{ Action = 'ShadowStorage'; ForVolume = $details.ForVolume; OnVolume = $details.OnVolume
+            MaxSize = $details.ProposedMaxSize; AcknowledgeIrreversible = $true }
+        $result.ExecutionCommand = "scripts/clean-system.ps1 -Action ShadowStorage -ForVolume '" + $details.ForVolume + "' -OnVolume '" + $details.OnVolume + "' -MaxSize '" + $details.ProposedMaxSize + "' -AcknowledgeIrreversible"
+        return $result
+    }
+    if ($Entry.Path -and $Entry.Category -notin @('installed-software', 'old-installers', 'reserved-storage') -and
+        $Entry.Status -notin @('not-found', 'reparse-point', 'cloud-excluded')) {
+        try {
+            $chain = Test-CleanerPathChain -LiteralPath $Entry.Path
+            if (-not $chain.IsSafe) { throw $chain.Reason }
+        }
+        catch { $result.Action = 'keep'; $result.SafetyBlocked = $true; $result.Notes += ' 路径链检查失败：' + $_.Exception.Message; return $result }
+    }
     if ($Entry.Action -eq 'migrate') {
         $result.Notes += ' 人工迁移指引；须先核对迁移脚本支持的 Item/Source 和目标位置，未提供直接执行命令。'
         return $result
@@ -857,15 +1529,31 @@ function Get-ScanRecommendation {
         $systemActions[$systemDrive + '\Windows.old'] = 'WindowsOld'
         $systemActions[$systemDrive + '\hiberfil.sys'] = 'Hibernate'
     }
+    if ($Entry.Category -eq 'recycle-bin' -and (Get-ScanProperty $Entry @('OriginalUserOnly') $false)) {
+        $sid = [string](Get-ScanProperty $Context @('OriginalUserSid') '')
+        if ($sid -and $path -ieq ($systemDrive + '\$Recycle.Bin\' + $sid) -and
+            (Get-ScanProperty $Context @('CurrentUserSid') '') -eq $sid) { $systemActions[$path] = 'RecycleBin' }
+    }
     if ($Entry.HandlerScript -eq 'scripts/clean-system.ps1' -and $systemActions.ContainsKey($path)) {
         $action = $systemActions[$path]
+        try {
+            if ($action -in @('ComponentStore', 'Hibernate')) { $check = Test-CleanerPathChain -LiteralPath $path }
+            else {
+                $safeCategory = $action
+                if ($action -eq 'UpdateCache') { $safeCategory = 'WindowsUpdate' }
+                if ($action -eq 'CrashDumps') { $safeCategory = 'CrashDumpReports' }
+                $check = Test-SafeTarget -LiteralPath $path -Category $safeCategory -Context $Context
+            }
+            if (-not $check.IsSafe) { throw $check.Reason }
+        }
+        catch { $result.Action = 'keep'; $result.SafetyBlocked = $true; $result.Notes += ' 安全检查失败：' + $_.Exception.Message; return $result }
         $result.Action = 'system-tool'; $result.HandlerScript = 'scripts/clean-system.ps1'
         $result.HandlerParameters['Action'] = $action
         $result.ExecutionCommand = 'scripts/clean-system.ps1 -Action ' + $action
         if ($action -eq 'Hibernate') {
             $result.HandlerParameters['Mode'] = 'Reduced'; $result.ExecutionCommand += ' -Mode Reduced'
         }
-        if ($action -in @('CrashDumps', 'WindowsOld', 'Hibernate')) {
+        if ($action -in @('RecycleBin', 'CrashDumps', 'WindowsOld', 'Hibernate')) {
             $result.HandlerParameters['AcknowledgeIrreversible'] = $true
             $result.ExecutionCommand += ' -AcknowledgeIrreversible'
         }
@@ -878,13 +1566,17 @@ function Get-ScanRecommendation {
             'temp' {
                 if ($windows -and $path -ieq ($windows + '\Temp')) { $cacheCategory = 'WindowsTemp' }
                 else {
-                    $temp = [string](Get-ScanProperty $Context @('OriginalTempPath', 'UserTempPath', 'TempPath', 'Temp'))
+                    $temp = [string](Get-ScanProperty $Context @('StandardTempPath', 'OriginalTempPath', 'UserTempPath', 'TempPath', 'Temp'))
                     if ($temp -and $path -ieq $temp.TrimEnd('\')) { $cacheCategory = 'UserTemp' }
                 }
             }
             'thumbnail-cache' { $cacheCategory = 'ThumbnailCache' }
             'browser-cache' { $cacheCategory = 'BrowserCache' }
             'developer-cache' { $cacheCategory = 'DevCache' }
+            'app-cache' { $cacheCategory = 'AppCache' }
+            'shader-cache' { $cacheCategory = 'ShaderCache' }
+            'inet-cache' { $cacheCategory = 'InetCache' }
+            'system-logs' { $cacheCategory = 'SystemLogs' }
         }
     }
     if ($cacheCategory) {
@@ -898,13 +1590,14 @@ function Get-ScanRecommendation {
                 $result.Notes += ' 按原用户身份运行；浏览器须完全退出。开发缓存须由工具解析实际位置并通过安全检查，工具不可用或配置不符会跳过。'
                 return $result
             }
+            $result.SafetyBlocked = $true; $result.Action = 'keep'
             $result.Notes += ' 未通过清理范围检查：' + [string](Get-ScanProperty $check @('Reason', 'Message') '无明确安全结论。')
         }
-        catch { $result.Notes += ' 无法核对清理范围：' + $_.Exception.Message }
+        catch { $result.SafetyBlocked = $true; $result.Action = 'keep'; $result.Notes += ' 无法核对清理范围：' + $_.Exception.Message }
     }
     $result.Notes += ' 此条目没有覆盖整项的脚本清理选择器；请按上述说明在系统/软件界面人工处理，勿直接递归删除。'
     if ($Entry.Category -eq 'recycle-bin') {
-        $result.Notes += ' 此处是所有用户汇总；clean-system.ps1 -Action RecycleBin 仅处理原用户，不能用于估算整项清理收益。'
+        $result.Notes += ' 只能在已核实的原用户会话处理该用户的回收站，不借用其他账户身份。'
     }
     return $result
 }
@@ -914,6 +1607,10 @@ $context = Get-CleanerContext
 $script:ScanOriginalProfile = [string](Get-ScanProperty $context @('OriginalUserProfile', 'OriginalProfilePath', 'UserProfile', 'UserProfilePath') '')
 if ([string]::IsNullOrWhiteSpace($script:ScanOriginalProfile)) { throw '共享上下文未提供原用户目录，已停止。' }
 $originalSid = [string](Get-ScanProperty $context @('OriginalUserSid', 'OriginalUserSID', 'UserSid', 'UserSID', 'Sid') '')
+try { $script:ScanKnownFolders = Get-CleanerKnownFolderMap -Context $context }
+catch { Add-ScanIssue $script:ScanOriginalProfile 'KnownFolders' $_.Exception.Message }
+foreach ($syncRoot in @(Get-ScanProperty $context @('SyncRoots') @())) { Add-ScanCloudRoot $syncRoot }
+
 $isAdmin = [bool](Get-ScanProperty $context @('IsAdmin', 'IsAdministrator') $false)
 if ([string]::IsNullOrWhiteSpace($OutputPath)) {
     $logDirectory = [string](Get-ScanProperty $context @('LogDirectory', 'LogDir') '')
@@ -945,10 +1642,10 @@ catch { $baseline.Error = $_.Exception.Message; Add-ScanIssue 'C:' 'Baseline' $_
 Write-Host '正在只读发现系统项、用户目录和已知软件数据位置…'
 $systemTargets = @(
     @('休眠文件', 'C:\hiberfil.sys', 'hibernation', 'system-tool', 3, 'allocated-upper-bound', '禁用休眠同时影响快速启动和混合睡眠；也可评估 reduced 模式。'),
-    @('页面文件', 'C:\pagefile.sys', 'pagefile', 'keep', 3, 'none', '默认保留系统管理；迁移影响提交上限、崩溃转储，并需重启验证。'),
-    @('交换文件', 'C:\swapfile.sys', 'pagefile', 'keep', 3, 'none', '系统管理，不直接删除。'),
+    @('页面文件', 'C:\pagefile.sys', 'pagefile', 'manual', 3, 'none', '默认保留系统管理；迁移影响提交上限、崩溃转储，并需重启验证。'),
+    @('交换文件', 'C:\swapfile.sys', 'swapfile', 'keep', 3, 'none', '系统管理，不直接删除。'),
     @('Windows 临时目录', 'C:\Windows\Temp', 'temp', 'delete', 0, 'allocated-upper-bound', '实际清理跳过近期和被占用文件。'),
-    @('Windows 更新目录汇总', 'C:\Windows\SoftwareDistribution', 'windows-update-summary', 'system-tool', 2, 'none', '由存储感知/磁盘清理处理；更新进行时跳过，不把整个目录大小当可释放量。'),
+    @('Windows 更新目录汇总', 'C:\Windows\SoftwareDistribution', 'windows-update-summary', 'keep', 2, 'none', '由存储感知/磁盘清理处理；更新进行时跳过，不把整个目录大小当可释放量。'),
     @('Windows 更新下载缓存', 'C:\Windows\SoftwareDistribution\Download', 'windows-update', 'system-tool', 2, 'allocated-upper-bound', '仅通过受支持的系统清理流程；更新进行时跳过。'),
     @('旧系统 Windows.old', 'C:\Windows.old', 'upgrade-residue', 'system-tool', 3, 'allocated-upper-bound', '清理后无法回退旧系统，必须独立确认。'),
     @('升级残留 $WINDOWS.~BT', 'C:\$WINDOWS.~BT', 'upgrade-residue', 'system-tool', 3, 'allocated-upper-bound', '使用系统磁盘清理；可能失去升级回退能力。'),
@@ -958,7 +1655,7 @@ $systemTargets = @(
     @('传递优化缓存', 'C:\ProgramData\Microsoft\Windows\DeliveryOptimization\Cache', 'delivery-optimization', 'system-tool', 1, 'allocated-upper-bound', '使用存储感知/磁盘清理。'),
     @('传递优化服务缓存', 'C:\Windows\ServiceProfiles\NetworkService\AppData\Local\Microsoft\Windows\DeliveryOptimization\Cache', 'delivery-optimization', 'system-tool', 1, 'allocated-upper-bound', '使用系统工具；不更改服务状态。'),
     @('Windows 搜索索引', 'C:\ProgramData\Microsoft\Search\Data\Applications\Windows', 'search-index', 'system-tool', 2, 'none', '用索引选项调整范围、重建或官方位置设置；重建不能保证长期释放。'),
-    @('回收站（所有用户）', 'C:\$Recycle.Bin', 'recycle-bin', 'system-tool', 3, 'allocated-upper-bound', '永久清空不可恢复，须独立确认；权限不足会保留未知。'),
+    @('回收站（所有用户）', 'C:\$Recycle.Bin', 'recycle-bin-summary', 'keep', 3, 'allocated-upper-bound', '永久清空不可恢复，须独立确认；权限不足会保留未知。'),
     @('Windows 错误报告', 'C:\ProgramData\Microsoft\Windows\WER', 'error-reports', 'system-tool', 3, 'allocated-upper-bound', '有诊断价值，删除不可逆，须独立确认。'),
     @('小型崩溃转储', 'C:\Windows\Minidump', 'crash-dump', 'system-tool', 3, 'allocated-upper-bound', '有诊断价值，删除不可逆，须独立确认。'),
     @('内存转储', 'C:\Windows\MEMORY.DMP', 'crash-dump', 'system-tool', 3, 'allocated-upper-bound', '有诊断价值，删除不可逆，须独立确认。'),
@@ -970,6 +1667,15 @@ foreach ($target in $systemTargets) {
     if ($target[3] -eq 'keep') { $handler = '' }
     Add-ScanTarget -Name $target[0] -LiteralPath $target[1] -Category $target[2] -Action $target[3] -Risk $target[4] `
         -Estimate $target[5] -Notes $target[6] -HandlerScript $handler -IncludeMissing
+}
+if ($originalSid) {
+    $recyclePath = 'C:\$Recycle.Bin\' + $originalSid
+    Add-ScanTarget -Name '原用户 C 盘回收站' -LiteralPath $recyclePath -Category 'recycle-bin' `
+        -Action system-tool -Risk 3 -HandlerScript 'scripts/clean-system.ps1' -Estimate allocated-upper-bound
+    $recycleKey = $recyclePath.ToLowerInvariant()
+    if ($script:ScanTargets.ContainsKey($recycleKey)) {
+        $script:ScanTargets[$recycleKey] | Add-Member -NotePropertyName OriginalUserOnly -NotePropertyValue $true
+    }
 }
 Add-ScanTarget -Name 'Windows 组件存储（DISM）' -LiteralPath 'C:\Windows\WinSxS' -Category 'component-store' `
     -Action system-tool -Risk 2 -HandlerScript 'scripts/clean-system.ps1' -IncludeMissing -MetadataOnly `
@@ -1123,6 +1829,58 @@ foreach ($uninstallKey in $uninstallKeys) {
     }
 }
 
+Add-ScanRegisteredCaches $context
+foreach ($folder in @($script:ScanKnownFolders.Keys | Sort-Object)) {
+    Add-ScanTarget -Name ('原用户：' + $folder) -LiteralPath $script:ScanKnownFolders[$folder] -Category 'user-files' `
+        -Action migrate -Risk 1 -HandlerScript 'scripts/migrate.ps1' -Estimate allocated-upper-bound -Priority 20 `
+        -Notes '已解析 Known Folder；用属性→位置迁移，先复制校验并验证独立备份，保留旧源。'
+}
+Write-Host '正在只读发现原用户大文件、旧安装包、软件清单及磁盘布局…'
+$diskLayout = Get-ScanDiskLayout
+$storageSenseEnabled = $null
+if (-not $Quick) {
+    $storageKey = 'Registry::HKEY_USERS\' + $originalSid + '\Software\Microsoft\Windows\CurrentVersion\StorageSense\Parameters\StoragePolicy'
+    $storageValue = Get-ScanRegistryValue $storageKey '01'
+    if ($null -ne $storageValue -and [string]$storageValue -in @('0', '1')) { $storageSenseEnabled = [string]$storageValue -eq '1' }
+    else { Add-ScanIssue $storageKey 'StorageSense' '状态缺失或不可读，存储感知状态未知。' }
+}
+$inventoryRoots = @($script:ScanKnownFolders.Keys | Where-Object { $_ -in @('Downloads', 'Desktop') } | ForEach-Object { $script:ScanKnownFolders[$_] })
+$largeFileInventory = [pscustomobject]@{ Status = 'skipped'; EstimatedBytes = $null; Files = @(); Reason = '未启用大文件发现或原用户身份未核实。' }
+$installerInventory = [pscustomobject]@{ Status = 'unknown'; EstimatedBytes = $null; Files = @(); Reason = '下载和桌面位置或原用户身份未核实。' }
+if ((Get-ScanProperty $context @('OriginalUserVerified') $false) -and
+    (Get-ScanProperty $context @('CurrentUserSid') '') -eq $originalSid) {
+    if ($LargeFileCount -gt 0) { $largeFileInventory = Get-ScanFileInventory @($script:ScanOriginalProfile) }
+    if ($inventoryRoots.Count -gt 0) { $installerInventory = Get-ScanFileInventory $inventoryRoots -Installers }
+}
+if ($Quick) {
+    $installerInventory = [pscustomobject]@{ Status = 'skipped'; EstimatedBytes = $null; Files = @(); Reason = '-Quick 跳过旧安装包发现，大小未知。' }
+}
+foreach ($file in @($largeFileInventory.Files)) {
+    # 同一路径已有更具体建议时保留两种发现证据，键可区分；无自动删除授权。
+    $script:ScanExtraEntries.Add((New-ScanInventoryEntry ('large-file:' + $file.Path.ToLowerInvariant()) `
+        ('大文件：' + $file.Path) 'large-file' $file.Path $file.LogicalBytes $file))
+}
+if (@($installerInventory.Files).Count -gt 0) {
+    $topFiles = @($installerInventory.Files | Select-Object -First 20)
+    $details = [pscustomobject]@{ Paths = $inventoryRoots; Files = $topFiles; FileCount = @($installerInventory.Files).Count
+        SizeKind = 'logical'; KnownLowerBoundBytes = Get-ScanProperty $installerInventory @('KnownLowerBoundBytes') }
+    $entry = New-ScanInventoryEntry 'inventory:old-installers' '旧安装包和归档（先逐个审阅）' 'old-installers' `
+        $inventoryRoots[0] $installerInventory.EstimatedBytes $details
+    $entry.Status = $installerInventory.Status
+    if ($entry.Status -eq 'partial') { $entry.KnownLogicalBytes = $details.KnownLowerBoundBytes; $entry.KnownSizeKind = 'lower-bound' }
+    $script:ScanExtraEntries.Add($entry)
+}
+$softwareInventory = Get-ScanInstalledSoftware $originalSid
+foreach ($application in @($softwareInventory.Items | Where-Object { $null -ne $_.EstimatedBytes -and $_.EstimatedBytes -ge 500MB } | Select-Object -First 20)) {
+    $entry = New-ScanInventoryEntry ('software:' + $application.RegistryKey) ('已安装软件：' + $application.Name) `
+        'installed-software' $application.Path $application.EstimatedBytes $application
+    $entry.LogicalBytes = $null; $entry.KnownLogicalBytes = $null
+    $entry.Notes = '大小为厂商 EstimatedSize（KB）报告，非实测；位置未声明的项目不能确认在 C:。Program Files 绝不能靠复制移动。'
+    $script:ScanExtraEntries.Add($entry)
+}
+$script:ScanExtraEntries.Add((New-ScanInventoryEntry 'system:reserved-storage' 'Windows 保留存储（默认保留）' `
+    'reserved-storage' 'C:\' $null $null))
+
 Write-Host '正在读取大小；完整扫描可能较慢，-Quick 可跳过目录递归统计。'
 foreach ($entry in @($script:ScanTargets.psbase.Values | Sort-Object Path)) {
     Write-Verbose ('统计：' + $entry.Path)
@@ -1131,7 +1889,7 @@ foreach ($entry in @($script:ScanTargets.psbase.Values | Sort-Object Path)) {
     else { Measure-ScanEntry $entry }
 }
 # 各条目独立展示，明确标注父子重叠；不生成会重复计数的“总可释放量”。
-$entries = @($script:ScanTargets.psbase.Values)
+$entries = @($script:ScanTargets.psbase.Values) + @($script:ScanExtraEntries.ToArray())
 $reparseRecords = @{}
 foreach ($entry in $entries) {
     foreach ($point in @($entry.ReparsePoints)) {
@@ -1166,19 +1924,53 @@ foreach ($entry in $entries) {
     }
 }
 foreach ($entry in $entries) {
+    if (-not (Get-ScanProperty $entry @('EntryKey'))) {
+        $entry | Add-Member -NotePropertyName EntryKey -NotePropertyValue $entry.Path.TrimEnd('\').ToLowerInvariant()
+    }
+    if ($entry.Action -eq 'migrate') {
+        $entry | Add-Member -NotePropertyName MigrationWhatIf -NotePropertyValue (Get-ScanMigrationWhatIf $entry $context) -Force
+    }
     $recommendation = Get-ScanRecommendation $entry $context
     $entry.Action = $recommendation.Action; $entry.HandlerScript = $recommendation.HandlerScript
     $entry.HandlerParameters = $recommendation.HandlerParameters; $entry.ExecutionCommand = $recommendation.ExecutionCommand
     $entry.Notes = $recommendation.Notes
+    $entry | Add-Member -NotePropertyName SafetyBlocked -NotePropertyValue $recommendation.SafetyBlocked -Force
+    $classification = Get-ScanDisposition $entry
+    foreach ($field in @('Disposition', 'Impact', 'ManualReason', 'ManualSteps', 'DefaultSelected', 'Irreversible')) {
+        $entry | Add-Member -NotePropertyName $field -NotePropertyValue $classification.$field -Force
+    }
+    if ($entry.Disposition -ne 'ai') {
+        $entry.HandlerScript = ''; $entry.HandlerParameters = @{}; $entry.ExecutionCommand = $null
+    }
 }
+$confirmationItems = @(Get-ScanConfirmationItems $entries)
+$manualItems = @(Get-ScanManualItems $entries)
+$folderEvidence = @($entries | Where-Object { $_.Category -eq 'user-files' -and $_.Path -in @($script:ScanKnownFolders.Values) -and
+    -not $_.ExcludedFromLocalTotals -and -not $_.SafetyBlocked -and $_.Status -ne 'reparse-point' })
+$developmentEvidence = @($entries | Where-Object { $_.Category -match 'developer-cache|configured-development|^wsl|vhdx|vdisk|^docker-data$' -and
+    -not $_.ExcludedFromLocalTotals -and -not $_.SafetyBlocked -and $_.Status -ne 'reparse-point' })
+$folderAggregate = Get-ScanSizeAggregate $folderEvidence 'AllocatedBytes' 'KnownAllocatedBytes'
+$developmentAggregate = Get-ScanSizeAggregate $developmentEvidence 'AllocatedBytes' 'KnownAllocatedBytes'
+$verifiedSoftwareBytes = [long]0
+foreach ($application in @($softwareInventory.Items | Where-Object { $_.LocationVerified -and $null -ne $_.EstimatedBytes })) {
+    $verifiedSoftwareBytes += $application.EstimatedBytes
+}
+$hibernation = @($entries | Where-Object { $_.Category -eq 'hibernation' -and $_.Status -ne 'not-found' -and -not $_.SafetyBlocked })
+$advisoryEvidence = [pscustomobject]@{
+    UserFolderBytes = if ($null -ne $folderAggregate.TotalBytes -or $folderAggregate.KnownLowerBoundBytes -gt 0) { $folderAggregate.KnownLowerBoundBytes } else { $null }
+    DevelopmentBytes = if ($null -ne $developmentAggregate.TotalBytes -or $developmentAggregate.KnownLowerBoundBytes -gt 0) { $developmentAggregate.KnownLowerBoundBytes } else { $null }
+    InstalledSoftwareBytes = if ($softwareInventory.Status -eq 'ok' -or $verifiedSoftwareBytes -gt 0) { $verifiedSoftwareBytes } else { $null }
+    HibernationBytes = if ($hibernation.Count -gt 0) { Get-ScanProperty $hibernation[0] @('AllocatedBytes', 'LogicalBytes') (Get-ScanProperty (Get-ScanProperty $hibernation[0] @('Metadata')) @('Length')) } else { $null } }
+$advisory = @(Get-ScanAdvisory $baseline $diskLayout $storageSenseEnabled $advisoryEvidence)
+
 $sortedEntries = @($entries | Sort-Object -Property @(
     @{ Expression = { if ($null -eq $_.EstimatedReclaimableBytes) { -1.0 } else { [double]$_.EstimatedReclaimableBytes } }; Descending = $true },
     @{ Expression = { $_.Path }; Descending = $false }
 ))
-$publicEntries = @($sortedEntries | Select-Object Name, Path, Category, LogicalBytes, AllocatedBytes, KnownLogicalBytes, KnownAllocatedBytes, KnownSizeKind, EstimatedReclaimableBytes,
-    EstimateKind, Action, Risk, HandlerScript, HandlerParameters, ExecutionCommand, Status, Notes, Skipped, ReparsePoints, ExcludedFromLocalTotals, OverlapsOtherEntries, Details)
+$publicEntries = @($sortedEntries | Select-Object EntryKey, Name, Path, Category, LogicalBytes, AllocatedBytes, KnownLogicalBytes, KnownAllocatedBytes, KnownSizeKind, EstimatedReclaimableBytes,
+    EstimateKind, Action, Risk, HandlerScript, HandlerParameters, ExecutionCommand, Status, Notes, Skipped, ReparsePoints, ExcludedFromLocalTotals, OverlapsOtherEntries, Details, Disposition, Impact, ManualReason, ManualSteps, DefaultSelected, Irreversible)
 $report = [ordered]@{
-    SchemaVersion = 2; StartedAtUtc = $startedAt.ToString('o'); CompletedAtUtc = [DateTime]::UtcNow.ToString('o')
+    SchemaVersion = 3; StartedAtUtc = $startedAt.ToString('o'); CompletedAtUtc = [DateTime]::UtcNow.ToString('o')
     ComputerName = $env:COMPUTERNAME; Quick = [bool]$Quick; WhatIf = [bool]$WhatIfPreference
     Context = [ordered]@{ OriginalUserSid = $originalSid; OriginalUserProfile = $script:ScanOriginalProfile; IsAdmin = $isAdmin; PowerShellVersion = $PSVersionTable.PSVersion.ToString() }
     Baseline = $baseline; SizeUnit = 'bytes'; UnknownValue = $null
@@ -1188,10 +1980,17 @@ $report = [ordered]@{
         '拒绝访问/长路径/解析失败/Quick 跳过的值为 null；partial 的 KnownLogicalBytes/KnownAllocatedBytes 只是已知下限，KnownSizeKind 为 lower-bound，总量和可释放量仍为 null。',
         '按 EstimatedReclaimableBytes 降序排列，未知排在末尾；已知下限不当作可释放量参与排序。',
         'ExecutionCommand/HandlerParameters 只列出覆盖该路径的清理选择器；同一 Category/Action 可能处理多个条目，仍须满足身份、白名单、进程和更新状态检查。manual/migrate 条目按 Notes 人工操作。',
+        'ConfirmationItems 仅在同一执行选择器内去除父子重复，组间仍可能重叠，不能把所有确认项总量相加；KnownLowerBoundBytes 仅为已知大小下限，不是保证收益。',
+        'ManualItems/Inventories 的逻辑大小和厂商报告大小用于人工判断，不代表可释放量；Quick 跳过清单时总量仍为 null。',
+        'DefaultSelected 仅用于展示；所有动作仍须演练后明确确认，不可逆项必须由用户明确点名编号。',
         'OneDrive 根目录不递归计量且不计本地清理量；云占位不等于本地大小，已下载数据可由客户端释放空间。',
         'WinSxS 使用 DISM 数据；DISM 通常只报告候选组件和包数，估算上限不代表精确可回收量。',
         '扫描只发现默认位置、可访问的注册表和已知配置；不加载其他用户 hive，未知自定义位置可能遗漏。'
     )
+    ConfirmationItems = $confirmationItems; ManualItems = $manualItems; Advisory = $advisory
+    DiskLayout = $diskLayout; StorageSenseEnabled = $storageSenseEnabled
+    Inventories = [ordered]@{ LargeFiles = $largeFileInventory; OldInstallers = $installerInventory; InstalledSoftware = $softwareInventory }
+    AdvisoryEvidence = $advisoryEvidence
     Entries = $publicEntries; DiscoveryIssues = @($script:ScanIssues.ToArray()); OneDriveRoots = @($script:ScanCloudRoots.ToArray())
 }
 
@@ -1205,6 +2004,32 @@ $rows = @($sortedEntries | Where-Object { $_.Status -ne 'not-found' } | Select-O
 Write-Host ('C 盘基线：总量 {0}，可用 {1}' -f (Format-ScanBytes $baseline.TotalBytes), (Format-ScanBytes $baseline.FreeBytes))
 Write-Host ($rows | Format-Table -AutoSize | Out-String -Width 240)
 Write-Host '预计量为单项上限，父子条目不能相加；partial >= 为已知下限，总量及可释放量仍 unknown。按可释放量排序，未知在后；manual/migrate 请按 JSON Notes 人工处理。'
+
+Write-Host "`nA. 只需确认（AI 执行）"
+$confirmationRows = @($confirmationItems | Select-Object -First $Top | ForEach-Object {
+    [pscustomobject]@{ Id = $_.Id; '选择方式' = if ($_.DefaultSelected) { '默认选中' } else { '需单独点名' }
+        '项目' = $_.Title; '预计释放' = Format-ScanBytes $_.EstimatedReclaimableBytes; '影响' = $_.Impact.Summary
+        '风险' = @{ low = '低'; medium = '中'; high = '高' }[$_.Impact.RiskLevel]; '需关闭的程序' = ($_.Impact.RequiresClosedApps -join '、')
+        '需管理员' = if ($_.RequiresAdmin) { '是' } else { '否' }; '需重启' = if ($_.Impact.RequiresRestart) { '是' } else { '否' } }
+})
+Write-Host ($confirmationRows | Format-Table -Wrap | Out-String -Width 300)
+Write-Host '默认选中不代表已授权；先按编号展示完整作用范围并演练，明确确认后才能执行；需单独点名的项目必须逐项确认。'
+Write-Host "`nB. 需要你一步步操作"
+foreach ($item in @($manualItems | Select-Object -First $Top)) {
+    Write-Host ('{0}. {1}；大小 {2}' -f $item.Id, $item.Title, (Format-ScanBytes $item.EstimatedBytes))
+    Write-Host ('原因：' + $item.Reason)
+    if ($item.Paths.Count -gt 0) { Write-Host ('路径：' + ($item.Paths -join '；')) }
+    foreach ($step in $item.Steps) { Write-Host ('  ' + $step) }
+}
+Write-Host "`nC. 长期规划建议"
+foreach ($item in @($advisory | Select-Object -First $Top)) {
+    Write-Host ('[{0}] {1}：{2}' -f @{ info = '建议'; warn = '注意'; critical = '紧急' }[$item.Severity], $item.Title, $item.Detail)
+    $stepNumber = 0
+    foreach ($step in $item.Steps) { $stepNumber++; Write-Host ('  {0}. {1}' -f $stepNumber, $step) }
+}
+if ($confirmationItems.Count -gt $Top -or $manualItems.Count -gt $Top -or $advisory.Count -gt $Top) {
+    Write-Host ('每区最多显示 {0} 项；JSON 保留全部项目。' -f $Top)
+}
 
 if ($PSCmdlet.ShouldProcess($reportPath, '创建 JSON 扫描报告（必要时创建父目录）')) {
     $parent = Split-Path -Path $reportPath -Parent

@@ -6,6 +6,7 @@
     Contents 只允许清空目录内容；File 只允许指定文件；SelectedFiles 仅允许列出的文件名。
     ExternalOnly 类别只能交给官方工具处理，Remove-SafeItem 拒绝直接删除。
     MigrationOnly 类别仅授权迁移；Container 仅核实准确目录，不授权其内容。
+    App / ProcessNames 仅为显示名及须退出的进程名称；ExcludeChildren 保留准确子项及其后代。
 .PARAMETER Categories
     类别及其路径、范围、原用户身份要求和处理方式。
 .PARAMETER ForbiddenPaths
@@ -21,6 +22,7 @@
     UserScopedExecutables = @(
         'npm', 'npm.cmd', 'npm.exe', 'pip', 'pip.exe', 'pip3', 'pip3.exe'
         'conda', 'conda.exe', 'conda.bat', 'dotnet', 'dotnet.exe'
+        'yarn', 'yarn.cmd', 'pnpm', 'pnpm.cmd', 'pnpm.exe', 'go', 'go.exe'
     )
 
     # Known Folder 使用 Shell API 读取原用户当前路径，不猜测固定目录名。
@@ -126,21 +128,82 @@
             RequiresOriginalUser = $true
             ExternalOnly = $false
             Targets = @(
-                @{ Path = '%LOCALAPPDATA%\Google\Chrome\User Data\*\Cache'; Scope = 'Contents' }
-                @{ Path = '%LOCALAPPDATA%\Google\Chrome\User Data\*\Network\Cache'; Scope = 'Contents' }
-                @{ Path = '%LOCALAPPDATA%\Google\Chrome\User Data\*\Code Cache'; Scope = 'Contents' }
-                @{ Path = '%LOCALAPPDATA%\Google\Chrome\User Data\*\GPUCache'; Scope = 'Contents' }
-                @{ Path = '%LOCALAPPDATA%\Microsoft\Edge\User Data\*\Cache'; Scope = 'Contents' }
-                @{ Path = '%LOCALAPPDATA%\Microsoft\Edge\User Data\*\Network\Cache'; Scope = 'Contents' }
-                @{ Path = '%LOCALAPPDATA%\Microsoft\Edge\User Data\*\Code Cache'; Scope = 'Contents' }
-                @{ Path = '%LOCALAPPDATA%\Microsoft\Edge\User Data\*\GPUCache'; Scope = 'Contents' }
-                @{ Path = '%LOCALAPPDATA%\BraveSoftware\Brave-Browser\User Data\*\Cache'; Scope = 'Contents' }
-                @{ Path = '%LOCALAPPDATA%\BraveSoftware\Brave-Browser\User Data\*\Code Cache'; Scope = 'Contents' }
-                @{ Path = '%LOCALAPPDATA%\Chromium\User Data\*\Cache'; Scope = 'Contents' }
-                @{ Path = '%LOCALAPPDATA%\Chromium\User Data\*\Code Cache'; Scope = 'Contents' }
-                @{ Path = '%LOCALAPPDATA%\Mozilla\Firefox\Profiles\*\cache2'; Scope = 'Contents' }
-                @{ Path = '%LOCALAPPDATA%\Opera Software\Opera Stable\Cache'; Scope = 'Contents' }
-                @{ Path = '%LOCALAPPDATA%\Opera Software\Opera Stable\Code Cache'; Scope = 'Contents' }
+                @{ Path = '%LOCALAPPDATA%\Google\Chrome\User Data\*\Cache'; Scope = 'Contents'; App = 'Chrome'; ProcessNames = @('chrome') }
+                @{ Path = '%LOCALAPPDATA%\Google\Chrome\User Data\*\Network\Cache'; Scope = 'Contents'; App = 'Chrome'; ProcessNames = @('chrome') }
+                @{ Path = '%LOCALAPPDATA%\Google\Chrome\User Data\*\Code Cache'; Scope = 'Contents'; App = 'Chrome'; ProcessNames = @('chrome') }
+                @{ Path = '%LOCALAPPDATA%\Google\Chrome\User Data\*\GPUCache'; Scope = 'Contents'; App = 'Chrome'; ProcessNames = @('chrome') }
+                @{ Path = '%LOCALAPPDATA%\Microsoft\Edge\User Data\*\Cache'; Scope = 'Contents'; App = 'Edge'; ProcessNames = @('msedge') }
+                @{ Path = '%LOCALAPPDATA%\Microsoft\Edge\User Data\*\Network\Cache'; Scope = 'Contents'; App = 'Edge'; ProcessNames = @('msedge') }
+                @{ Path = '%LOCALAPPDATA%\Microsoft\Edge\User Data\*\Code Cache'; Scope = 'Contents'; App = 'Edge'; ProcessNames = @('msedge') }
+                @{ Path = '%LOCALAPPDATA%\Microsoft\Edge\User Data\*\GPUCache'; Scope = 'Contents'; App = 'Edge'; ProcessNames = @('msedge') }
+                @{ Path = '%LOCALAPPDATA%\BraveSoftware\Brave-Browser\User Data\*\Cache'; Scope = 'Contents'; App = 'Brave'; ProcessNames = @('brave') }
+                @{ Path = '%LOCALAPPDATA%\BraveSoftware\Brave-Browser\User Data\*\Code Cache'; Scope = 'Contents'; App = 'Brave'; ProcessNames = @('brave') }
+                @{ Path = '%LOCALAPPDATA%\Chromium\User Data\*\Cache'; Scope = 'Contents'; App = 'Chromium'; ProcessNames = @('chrome') }
+                @{ Path = '%LOCALAPPDATA%\Chromium\User Data\*\Code Cache'; Scope = 'Contents'; App = 'Chromium'; ProcessNames = @('chrome') }
+                @{ Path = '%LOCALAPPDATA%\Mozilla\Firefox\Profiles\*\cache2'; Scope = 'Contents'; App = 'Firefox'; ProcessNames = @('firefox') }
+                @{ Path = '%LOCALAPPDATA%\Opera Software\Opera Stable\Cache'; Scope = 'Contents'; App = 'Opera'; ProcessNames = @('opera') }
+                @{ Path = '%LOCALAPPDATA%\Opera Software\Opera Stable\Code Cache'; Scope = 'Contents'; App = 'Opera'; ProcessNames = @('opera') }
+            )
+        }
+        AppCache = @{
+            RequiresOriginalUser = $true
+            ExternalOnly = $false
+            Targets = @(
+                @{ Path = '%APPDATA%\Code\Cache'; Scope = 'Contents'; App = 'VS Code'; ProcessNames = @('Code') }
+                @{ Path = '%APPDATA%\Code\CachedData'; Scope = 'Contents'; App = 'VS Code'; ProcessNames = @('Code') }
+                @{ Path = '%APPDATA%\Code\Code Cache'; Scope = 'Contents'; App = 'VS Code'; ProcessNames = @('Code') }
+                @{ Path = '%APPDATA%\Code\GPUCache'; Scope = 'Contents'; App = 'VS Code'; ProcessNames = @('Code') }
+                @{ Path = '%APPDATA%\Code\CachedExtensionVSIXs'; Scope = 'Contents'; App = 'VS Code'; ProcessNames = @('Code') }
+                @{ Path = '%APPDATA%\Code\logs'; Scope = 'Contents'; App = 'VS Code'; ProcessNames = @('Code') }
+                @{ Path = '%APPDATA%\Microsoft\Teams\Cache'; Scope = 'Contents'; App = 'Teams 经典版'; ProcessNames = @('Teams') }
+                @{ Path = '%APPDATA%\Microsoft\Teams\Code Cache'; Scope = 'Contents'; App = 'Teams 经典版'; ProcessNames = @('Teams') }
+                @{ Path = '%APPDATA%\Microsoft\Teams\GPUCache'; Scope = 'Contents'; App = 'Teams 经典版'; ProcessNames = @('Teams') }
+                @{ Path = '%APPDATA%\Microsoft\Teams\tmp'; Scope = 'Contents'; App = 'Teams 经典版'; ProcessNames = @('Teams') }
+                @{ Path = '%APPDATA%\discord\Cache'; Scope = 'Contents'; App = 'Discord'; ProcessNames = @('Discord') }
+                @{ Path = '%APPDATA%\discord\Code Cache'; Scope = 'Contents'; App = 'Discord'; ProcessNames = @('Discord') }
+                @{ Path = '%APPDATA%\discord\GPUCache'; Scope = 'Contents'; App = 'Discord'; ProcessNames = @('Discord') }
+                @{ Path = '%APPDATA%\Slack\Cache'; Scope = 'Contents'; App = 'Slack'; ProcessNames = @('slack') }
+                @{ Path = '%APPDATA%\Slack\Code Cache'; Scope = 'Contents'; App = 'Slack'; ProcessNames = @('slack') }
+                @{ Path = '%APPDATA%\Slack\GPUCache'; Scope = 'Contents'; App = 'Slack'; ProcessNames = @('slack') }
+                @{
+                    Path = '%LOCALAPPDATA%\JetBrains\*\caches'; Scope = 'Contents'; App = 'JetBrains IDE'
+                    ProcessNames = @('idea64', 'pycharm64', 'webstorm64', 'goland64', 'clion64', 'rider64', 'datagrip64', 'phpstorm64', 'rubymine64', 'rustrover64')
+                }
+                @{
+                    Path = '%LOCALAPPDATA%\JetBrains\*\log'; Scope = 'Contents'; App = 'JetBrains IDE'
+                    ProcessNames = @('idea64', 'pycharm64', 'webstorm64', 'goland64', 'clion64', 'rider64', 'datagrip64', 'phpstorm64', 'rubymine64', 'rustrover64')
+                }
+                # 微信、QQ 和新版 Teams 的目录布局须按版本核实，暂不授权自动清理。
+            )
+        }
+        ShaderCache = @{
+            RequiresOriginalUser = $true
+            ExternalOnly = $false
+            Targets = @(
+                @{ Path = '%LOCALAPPDATA%\D3DSCache'; Scope = 'Contents'; App = 'Direct3D' }
+                @{ Path = '%LOCALAPPDATA%\NVIDIA\DXCache'; Scope = 'Contents'; App = 'NVIDIA' }
+                @{ Path = '%LOCALAPPDATA%\NVIDIA\GLCache'; Scope = 'Contents'; App = 'NVIDIA' }
+                @{ Path = '%LOCALAPPDATA%\AMD\DxCache'; Scope = 'Contents'; App = 'AMD' }
+                @{ Path = '%LOCALAPPDATA%\AMD\DxcCache'; Scope = 'Contents'; App = 'AMD' }
+                @{ Path = '%LOCALAPPDATA%\AMD\GLCache'; Scope = 'Contents'; App = 'AMD' }
+                @{ Path = '%LOCALAPPDATA%\AMD\VkCache'; Scope = 'Contents'; App = 'AMD' }
+                @{ Path = '%LOCALAPPDATA%\Intel\ShaderCache'; Scope = 'Contents'; App = 'Intel' }
+            )
+        }
+        InetCache = @{
+            RequiresOriginalUser = $true
+            ExternalOnly = $false
+            Targets = @(
+                # Outlook 的已打开附件副本可能包含未保存修改，连同所有子项一起保留。
+                @{ Path = '%LOCALAPPDATA%\Microsoft\Windows\INetCache'; Scope = 'Contents'; ExcludeChildren = @('Content.Outlook') }
+            )
+        }
+        SystemLogs = @{
+            RequiresOriginalUser = $false
+            ExternalOnly = $false
+            Targets = @(
+                @{ Path = '%SystemRoot%\Logs\CBS'; Scope = 'SelectedFiles'; FilePatterns = @('CbsPersist_*.log', 'CbsPersist_*.cab'); Recursive = $false }
+                @{ Path = '%SystemRoot%\Logs\WindowsUpdate'; Scope = 'SelectedFiles'; FilePatterns = @('*.etl'); Recursive = $false }
             )
         }
         DevCache = @{
@@ -167,6 +230,12 @@
                 @{ Path = '%LOCALAPPDATA%\Programs\miniconda3\pkgs'; Scope = 'Contents' }
                 @{ Path = '%LOCALAPPDATA%\Programs\anaconda3\pkgs'; Scope = 'Contents' }
                 @{ Path = '%USERPROFILE%\.gradle\caches\modules-2\files-2.1'; Scope = 'Contents' }
+                @{ Path = '%LOCALAPPDATA%\Yarn\Cache'; Scope = 'Contents' }
+                @{ Path = '%LOCALAPPDATA%\Yarn\Berry\cache'; Scope = 'Contents' }
+                @{ Path = '%LOCALAPPDATA%\pnpm\store'; Scope = 'Contents' }
+                @{ Path = '%LOCALAPPDATA%\pnpm-store'; Scope = 'Contents' }
+                @{ Path = '%LOCALAPPDATA%\go-build'; Scope = 'Contents' }
+                @{ Path = '%USERPROFILE%\go\pkg\mod'; Scope = 'Contents' }
             )
         }
         WER = @{

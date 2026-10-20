@@ -4,7 +4,7 @@
 .DESCRIPTION
 请先关闭有关应用。所有文件删除均交给 common.ps1 的 Remove-SafeItem，
 由共享库检查白名单、重解析点、文件年龄和占用情况。浏览器运行时跳过其缓存，
-只处理各 profile 下的 Cache、Code Cache、GPUCache、Network\Cache，不处理用户数据。
+仅按白名单处理各浏览器缓存，不处理用户数据。应用仍运行或进程查询失败时跳过该应用。
 开发缓存实际执行时才查询缓存路径，全部通过 DevCache 安全校验后才使用官方命令清理，
 不直接删除 .m2 或 .gradle。检测到安装、更新活动或待重启标志时跳过 WindowsTemp。
 开发工具命令不支持统一的文件年龄筛选，可能清理最近使用的缓存；需要保留
@@ -14,10 +14,10 @@
 仅报告计划查询和清理的命令，缓存路径标为待解析。实际执行期间持有缓存祖先的
 防替换句柄；缓存根不锁定，以允许官方工具删除根目录，仍有根及子项并发替换风险。
 .PARAMETER Category
-可多选 UserTemp、WindowsTemp、ThumbnailCache、BrowserCache、DevCache；默认全部。
+可多选 UserTemp、WindowsTemp、ThumbnailCache、BrowserCache、AppCache、ShaderCache、InetCache、SystemLogs、DevCache；默认全部。
 .PARAMETER MinAgeHours
 文件最短未修改时间（小时），默认 24，范围 0..876000。仅作用于 Remove-SafeItem；
-开发工具的官方缓存清理命令不支持此限制。
+SystemLogs 至少保留 168 小时内的文件；开发工具的官方缓存清理命令不支持此限制。
 .EXAMPLE
 .\clean-cache.ps1 -Category UserTemp,ThumbnailCache -MinAgeHours 48 -WhatIf
 演练清理至少 48 小时未修改的用户临时文件和缩略图缓存。
@@ -28,8 +28,8 @@
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
 param(
     [ValidateNotNullOrEmpty()]
-    [ValidateSet('UserTemp', 'WindowsTemp', 'ThumbnailCache', 'BrowserCache', 'DevCache')]
-    [string[]]$Category = @('UserTemp', 'WindowsTemp', 'ThumbnailCache', 'BrowserCache', 'DevCache'),
+    [ValidateSet('UserTemp', 'WindowsTemp', 'ThumbnailCache', 'BrowserCache', 'AppCache', 'ShaderCache', 'InetCache', 'SystemLogs', 'DevCache')]
+    [string[]]$Category = @('UserTemp', 'WindowsTemp', 'ThumbnailCache', 'BrowserCache', 'AppCache', 'ShaderCache', 'InetCache', 'SystemLogs', 'DevCache'),
 
     [ValidateRange(0, 876000)]
     [double]$MinAgeHours = 24
@@ -65,6 +65,7 @@ function Get-CacheResultField {
 $script:CacheCleanerCmdlet = $PSCmdlet
 $script:CacheCleanerContext = Get-CleanerContext
 $script:CacheCleanerSummary = [ordered]@{}
+$script:CacheCleanerBlockedApps = @{}
 $script:CacheCleanerLogPath = Get-CacheResultField $script:CacheCleanerContext @('LogPath', 'LogFilePath') '共享日志'
 $cacheUserProfile = Get-CacheResultField $script:CacheCleanerContext @('OriginalUserProfile', 'UserProfile', 'UserProfilePath', 'OriginalProfilePath')
 if ([string]::IsNullOrWhiteSpace([string]$cacheUserProfile)) {
@@ -91,6 +92,9 @@ if ([string]::IsNullOrWhiteSpace($cacheSystemRoot)) {
 foreach ($name in @($Category | Select-Object -Unique)) {
     $script:CacheCleanerSummary[$name] = [pscustomobject][ordered]@{
         Category = $name
+        Result = 'skipped'
+        FreedBytesEstimate = [long]0
+        SkippedReasons = @()
         FreedBytes = [long]0
         EstimatedFreedBytes = [long]0
         Measurement = 'Remove-SafeItem'
@@ -111,26 +115,32 @@ function Write-CacheAudit {
 }
 
 function Add-CacheSkip {
-    param([string]$Name, [string]$Path, [string]$Reason)
+    param([string]$Name, [string]$Path, [string]$Reason, [switch]$Quiet)
     $row = $script:CacheCleanerSummary[$Name]
     $row.SkippedItems.Add([pscustomobject]@{ Path = $Path; Reason = $Reason })
     $row.SkippedCount++
-    Write-Warning ('[{0}] 跳过 {1}：{2}' -f $Name, $Path, $Reason)
+    if (-not $Quiet) { Write-Warning ('[{0}] 跳过 {1}：{2}' -f $Name, $Path, $Reason) }
     Write-CacheAudit -Action ('CacheSkip/' + $Name) -Path $Path -Result ('跳过：' + $Reason)
 }
 
 function Remove-CacheTarget {
-    param([string]$Name, [string]$LiteralPath)
+    param([string]$Name, [string]$LiteralPath, [string[]]$ProcessNames = @(), [string]$App)
+    $effectiveMinAgeHours = $MinAgeHours
+    if ($Name -eq 'SystemLogs') { $effectiveMinAgeHours = [Math]::Max([double]168, $MinAgeHours) }
     try {
         if (-not (Test-Path -LiteralPath $LiteralPath -ErrorAction Stop)) {
             Add-CacheSkip $Name $LiteralPath '路径不存在'
             return
         }
-        if (-not $script:CacheCleanerCmdlet.ShouldProcess($LiteralPath, ('清理 {0}；保留最近 {1} 小时修改的文件' -f $Name, $MinAgeHours))) {
+        $safe = Test-SafeTarget -LiteralPath $LiteralPath -Category $Name -Context $script:CacheCleanerContext -ErrorAction Stop
+        if (-not $safe.IsSafe) { Add-CacheSkip $Name $LiteralPath $safe.Reason; return }
+        if (-not $script:CacheCleanerCmdlet.ShouldProcess($LiteralPath, ('清理 {0}；保留最近 {1} 小时修改的文件' -f $Name, $effectiveMinAgeHours))) {
             Add-CacheSkip $Name $LiteralPath 'WhatIf 演练或用户未确认'
             return
         }
-        $results = @(Remove-SafeItem -LiteralPath $LiteralPath -Category $Name -MinAgeHours $MinAgeHours -Confirm:$false -ErrorAction Stop)
+        # 确认后再检查应用状态；不终止进程，状态变化时保留该应用余下的目标。
+        if ($ProcessNames.Count -gt 0 -and -not (Test-CacheAppStopped $Name $ProcessNames $LiteralPath $App)) { return }
+        $results = @(Remove-SafeItem -LiteralPath $LiteralPath -Category $Name -MinAgeHours $effectiveMinAgeHours -Context $script:CacheCleanerContext -Confirm:$false -ErrorAction Stop)
         if ($results.Count -eq 0) {
             Add-CacheSkip $Name $LiteralPath '共享删除函数未返回结果，释放量未知；请检查共享日志'
             return
@@ -149,6 +159,10 @@ function Remove-CacheTarget {
                     $reason = '共享库跳过；原因详见共享日志'
                 }
                 Add-CacheSkip $Name ([string]$skipPath) ([string]$reason)
+            }
+            if ((Get-CacheResultField $result @('DeletedCount') 0) -gt 0 -or
+                (Get-CacheResultField $result @('IsComplete') ($skipped.Count -eq 0))) {
+                $script:CacheCleanerSummary[$Name].Result = 'done'
             }
             Write-CacheAudit -Action ('CacheRemove/' + $Name) -Path $LiteralPath -Result '已处理；详细跳过项见共享删除结果' -Bytes $safeBytes
         }
@@ -194,21 +208,29 @@ function Remove-CacheDirectoryChildren {
     }
 }
 
-function Test-CacheBrowserStopped {
-    param([string]$ProcessName, [string]$Target)
-    try {
-        # 查询所有进程以区分“不存在”和“查询失败”；查询失败同样跳过。
-        $running = @(Get-Process -ErrorAction Stop | Where-Object { $_.ProcessName -ieq $ProcessName })
-        if ($running.Count -gt 0) {
-            Add-CacheSkip 'BrowserCache' $Target ('检测到 {0} 浏览器进程；请完全退出浏览器（含后台进程）后重试' -f $ProcessName)
-            return $false
-        }
-        return $true
-    }
-    catch {
-        Add-CacheSkip 'BrowserCache' $Target ('无法可靠查询浏览器进程：' + $_.Exception.Message)
+function Test-CacheAppStopped {
+    param([string]$Name, [string[]]$ProcessNames, [string]$Target, [string]$App)
+    if ([string]::IsNullOrWhiteSpace($App)) { $App = $ProcessNames -join '/' }
+    $key = $Name + '/' + $App
+    if ($script:CacheCleanerBlockedApps.ContainsKey($key)) {
+        Add-CacheSkip $Name $Target $script:CacheCleanerBlockedApps[$key]
         return $false
     }
+    $reason = $null
+    try {
+        # 查询所有进程以区分“不存在”和“查询失败”；查询失败同样跳过。
+        $running = @(Get-Process -ErrorAction Stop | Where-Object { $ProcessNames -contains $_.ProcessName })
+        if ($running.Count -gt 0) {
+            $reason = '检测到 {0} 进程（{1}）；请完全退出应用（含后台进程）后重试' -f $App, (($running | Select-Object -ExpandProperty ProcessName -Unique) -join '、')
+        }
+    }
+    catch { $reason = '无法可靠查询 ' + $App + ' 的进程，保留该应用缓存：' + $_.Exception.Message }
+    if ($null -ne $reason) {
+        $script:CacheCleanerBlockedApps[$key] = $reason
+        Add-CacheSkip $Name $Target $reason
+        return $false
+    }
+    return $true
 }
 
 function Get-CacheWindowsTempActivity {
@@ -247,34 +269,47 @@ function Get-CacheWindowsTempActivity {
     return [pscustomobject]@{ IsBusy = ($reasons.Count -gt 0); Reasons = $reasons.ToArray() }
 }
 
-function Clear-CacheBrowsers {
-    $browsers = @(
-        @{ Process = 'chrome'; Root = (Join-Path $cacheLocalAppData 'Google\Chrome\User Data') },
-        @{ Process = 'msedge'; Root = (Join-Path $cacheLocalAppData 'Microsoft\Edge\User Data') }
-    )
-    foreach ($browser in $browsers) {
-        if (-not (Test-CacheBrowserStopped $browser.Process $browser.Root)) { continue }
-        try {
-            if (-not (Test-Path -LiteralPath $browser.Root -PathType Container -ErrorAction Stop)) {
-                Add-CacheSkip 'BrowserCache' $browser.Root '未找到浏览器用户目录'
-                continue
-            }
-            # 仅枚举 profile 的直接子目录，不递归扫描用户数据。
-            $profiles = @(Get-ChildItem -LiteralPath $browser.Root -Directory -Force -ErrorAction Stop)
-            foreach ($profile in $profiles) {
-                foreach ($cacheName in @('Cache', 'Code Cache', 'GPUCache', 'Network\Cache')) {
-                    $target = Join-Path $profile.FullName $cacheName
-                    if (-not (Test-Path -LiteralPath $target -ErrorAction Stop)) { continue }
-                    # 再次查询，尽量缩短浏览器启动与实际删除之间的间隔。
-                    if (-not (Test-CacheBrowserStopped $browser.Process $target)) { break }
-                    Remove-CacheTarget 'BrowserCache' $target
-                }
-            }
+function Resolve-CacheTargetPaths {
+    param([string]$Name, [string]$Pattern)
+    $expanded = Expand-CleanerPath -Pattern $Pattern -Context $script:CacheCleanerContext
+    if ($expanded -notmatch '[*?]') { return $expanded }
+    $segments = $expanded.Split([char]'\')
+    $wildcards = @($segments | Where-Object { $_ -match '[*?]' })
+    if ($wildcards.Count -ne 1 -or $wildcards[0] -ne '*') { throw '缓存路径只允许一个完整路径段的 * 通配符。' }
+    $index = [Array]::IndexOf($segments, '*')
+    $parent = $segments[0..($index - 1)] -join '\'
+    $suffix = $segments[($index + 1)..($segments.Count - 1)] -join '\'
+    $check = Test-CleanerPathChain -LiteralPath $parent -AllowMissing
+    if (-not $check.IsSafe) { throw $check.Reason }
+    if (-not $check.Exists) { Add-CacheSkip $Name $parent '通配目标的父目录不存在'; return }
+    # 与浏览器 profile 相同，只枚举一个路径段；共享枚举器保护祖先且不递归。
+    foreach ($child in @(Get-CleanerChildren -LiteralPath $parent)) {
+        if (-not $child.PSIsContainer) { continue }
+        if (($child.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            Add-CacheSkip $Name $child.FullName '重解析点，拒绝跟随'
+            continue
         }
-        catch {
-            Add-CacheSkip 'BrowserCache' $browser.Root $_.Exception.Message
-        }
+        Join-Path $child.FullName $suffix
     }
+}
+
+function Clear-CacheWhitelistCategory {
+    param([string]$Name)
+    foreach ($entry in (Get-CleanerTargets).Categories[$Name].Targets) {
+        try {
+            $processNames = @()
+            if ($entry.ContainsKey('ProcessNames')) { $processNames = @($entry['ProcessNames']) }
+            if ($processNames.Count -gt 0 -and -not (Test-CacheAppStopped $Name $processNames $entry.Path $entry['App'])) { continue }
+            foreach ($path in @(Resolve-CacheTargetPaths -Name $Name -Pattern $entry.Path)) {
+                Remove-CacheTarget -Name $Name -LiteralPath $path -ProcessNames $processNames -App $entry['App']
+            }
+        }
+        catch { Add-CacheSkip $Name $entry.Path $_.Exception.Message }
+    }
+}
+
+function Clear-CacheBrowsers {
+    Clear-CacheWhitelistCategory 'BrowserCache'
 }
 
 function Get-CacheSystemFreeBytes {
@@ -289,7 +324,7 @@ function Get-CacheSystemFreeBytes {
 function Invoke-CachePathQuery {
     [CmdletBinding()]
     param([string]$FilePath, [string[]]$ArgumentList)
-    $fixedQueries = @('config get cache', 'cache dir', 'info --json', 'nuget locals all --list --force-english-output')
+    $fixedQueries = @('config get cache', 'cache dir', 'info --json', 'nuget locals all --list --force-english-output', 'store path', 'env GOCACHE', 'env GOMODCACHE')
     if ($null -eq $ArgumentList -or $fixedQueries -notcontains ($ArgumentList -join ' ') -or
         @($ArgumentList | Where-Object { $_ -match '\s' }).Count -gt 0) {
         throw '只允许固定的开发缓存路径查询；拒绝其他参数。'
@@ -312,16 +347,25 @@ function Invoke-CachePathQuery {
 }
 
 function Get-CacheDeveloperPath {
-    param([ValidateSet('npm', 'pip', 'conda', 'dotnet')][string]$Name, [string]$FilePath)
+    param([ValidateSet('npm', 'pip', 'conda', 'dotnet', 'yarn', 'pnpm', 'go')][string]$Name, [string]$FilePath)
     $paths = New-Object 'System.Collections.Generic.List[string]'
     switch ($Name) {
-        { $_ -in @('npm', 'pip') } {
+        { $_ -in @('npm', 'pip', 'yarn', 'pnpm') } {
             $queryArguments = @('config', 'get', 'cache')
-            if ($Name -eq 'pip') { $queryArguments = @('cache', 'dir') }
+            if ($Name -in @('pip', 'yarn')) { $queryArguments = @('cache', 'dir') }
+            if ($Name -eq 'pnpm') { $queryArguments = @('store', 'path') }
             $text = Invoke-CachePathQuery -FilePath $FilePath -ArgumentList $queryArguments
             $lines = @($text -split '\r?\n' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
             if ($lines.Count -ne 1) { throw ($Name + ' 未返回唯一的缓存目录；拒绝猜测路径。') }
             $paths.Add($lines[0])
+        }
+        'go' {
+            foreach ($variable in @('GOCACHE', 'GOMODCACHE')) {
+                $text = Invoke-CachePathQuery -FilePath $FilePath -ArgumentList @('env', $variable)
+                $lines = @($text -split '\r?\n' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+                if ($lines.Count -ne 1) { throw ('go env ' + $variable + ' 未返回唯一缓存目录；拒绝猜测路径。') }
+                $paths.Add($lines[0])
+            }
         }
         'conda' {
             $text = Invoke-CachePathQuery -FilePath $FilePath -ArgumentList @('info', '--json')
@@ -393,7 +437,10 @@ function Clear-CacheDeveloperTools {
         @{ Name = 'npm'; Query = 'config get cache'; Arguments = @('cache', 'clean', '--force') },
         @{ Name = 'pip'; Query = 'cache dir'; Arguments = @('cache', 'purge') },
         @{ Name = 'conda'; Query = 'info --json'; Arguments = @('clean', '--tarballs', '--packages', '-y') },
-        @{ Name = 'dotnet'; Query = 'nuget locals all --list --force-english-output'; Arguments = @('nuget', 'locals', 'all', '--clear') }
+        @{ Name = 'dotnet'; Query = 'nuget locals all --list --force-english-output'; Arguments = @('nuget', 'locals', 'all', '--clear') },
+        @{ Name = 'yarn'; Query = 'cache dir'; Arguments = @('cache', 'clean') },
+        @{ Name = 'pnpm'; Query = 'store path'; Arguments = @('store', 'prune') },
+        @{ Name = 'go'; Query = 'env GOCACHE / go env GOMODCACHE'; Arguments = @('clean', '-cache'); AdditionalArguments = @('clean', '-modcache') }
     )
     # 必须先于工具发现、身份核实和路径解析返回；只描述计划，不启动查询或清理。
     if ($WhatIfPreference) {
@@ -401,6 +448,7 @@ function Clear-CacheDeveloperTools {
             $plannedArguments = $tool['Arguments'] -join ' '
             if ($tool['Name'] -eq 'npm') { $plannedArguments = '--cache <待解析> ' + $plannedArguments }
             if ($tool['Name'] -eq 'pip') { $plannedArguments = '--cache-dir <待解析> ' + $plannedArguments }
+            if ($tool.ContainsKey('AdditionalArguments')) { $plannedArguments += '；' + $tool['Name'] + ' ' + ($tool['AdditionalArguments'] -join ' ') }
             Write-Information ('[{0}] WhatIf：将查询 {0} {1}；缓存路径待解析。通过身份及路径校验后将执行 {0} {2}（不按年龄筛选）；本次不启动工具。' -f $tool['Name'], $tool['Query'], $plannedArguments) -InformationAction Continue
             Add-CacheSkip 'DevCache' $tool['Name'] 'WhatIf 演练；工具可用性及缓存路径待解析，未执行查询或清理'
         }
@@ -430,7 +478,7 @@ function Clear-CacheDeveloperTools {
         try {
             $commands = @(Get-Command -Name $tool.Name -CommandType Application -ErrorAction SilentlyContinue)
             if ($commands.Count -eq 0) {
-                Add-CacheSkip 'DevCache' $tool.Name '未找到可执行工具'
+                Add-CacheSkip 'DevCache' $tool.Name '工具未安装' -Quiet
                 continue
             }
             $exe = $commands[0].Source
@@ -453,48 +501,55 @@ function Clear-CacheDeveloperTools {
             if ($tool['Name'] -eq 'npm') { $cleanArguments = @('--cache', $paths[0], 'cache', 'clean', '--force') }
             if ($tool['Name'] -eq 'pip') { $cleanArguments = @('--cache-dir', $paths[0], 'cache', 'purge') }
             $description = $tool['Name'] + ' ' + ($cleanArguments -join ' ')
+            if ($tool.ContainsKey('AdditionalArguments')) { $description += '；' + $tool['Name'] + ' ' + ($tool['AdditionalArguments'] -join ' ') }
             if (-not $script:CacheCleanerCmdlet.ShouldProcess($exe, ('执行官方开发缓存清理（不按年龄筛选）：' + $description))) {
                 Add-CacheSkip 'DevCache' $description 'WhatIf 演练或用户未确认'
                 continue
             }
-            if ($tool['Name'] -in @('conda', 'dotnet')) {
-                # 这两类清理命令不能逐项固定路径；确认后再查询，配置变化即拒绝执行。
+            if ($tool['Name'] -in @('conda', 'dotnet', 'yarn', 'pnpm', 'go')) {
+                # 这些清理命令依赖工具配置；确认后再查询，配置变化即拒绝执行。
                 $currentPaths = @(Get-CacheDeveloperPath -Name $tool['Name'] -FilePath $exe | Select-Object -Unique)
                 Assert-CacheDeveloperTarget -Name $tool['Name'] -Paths $currentPaths
                 if (@(Compare-Object -ReferenceObject $paths -DifferenceObject $currentPaths).Count -gt 0) {
                     throw '确认期间缓存配置发生变化；请重新运行以检查新的清理范围。'
                 }
             }
-            # 祖先句柄保持到工具结束及后置校验完成；根和子项仍可能被并发替换。
-            Assert-CacheDeveloperTarget -Name $tool['Name'] -Paths $paths
-            $before = Get-CacheSystemFreeBytes
-            try {
-                $results = @(Invoke-External -FilePath $exe -ArgumentList $cleanArguments -Description $description `
-                    -Context $script:CacheCleanerContext -Confirm:$false -ErrorAction Stop)
+            $commandsToRun = @(@{ Arguments = $cleanArguments })
+            if ($tool.ContainsKey('AdditionalArguments')) { $commandsToRun += @{ Arguments = $tool['AdditionalArguments'] } }
+            foreach ($commandToRun in $commandsToRun) {
+                $cleanArguments = $commandToRun.Arguments
+                $description = $tool['Name'] + ' ' + ($cleanArguments -join ' ')
+                # 祖先句柄保持到工具结束及后置校验完成；根和子项仍可能被并发替换。
+                Assert-CacheDeveloperTarget -Name $tool['Name'] -Paths $paths
+                $before = Get-CacheSystemFreeBytes
+                try {
+                    $results = @(Invoke-External -FilePath $exe -ArgumentList $cleanArguments -Description $description `
+                        -Context $script:CacheCleanerContext -Confirm:$false -ErrorAction Stop)
+                }
+                finally {
+                    # 成功、非零退出或抛错均重查根及祖先的重解析点；允许工具正常删除缓存根。
+                    try { Assert-CacheDeveloperTarget -Name $tool['Name'] -Paths $paths }
+                    catch { throw ('工具运行后路径安全校验失败：' + $_.Exception.Message) }
+                }
+                $after = Get-CacheSystemFreeBytes
+                $estimated = [long]0
+                if ($null -ne $before -and $null -ne $after) {
+                    $estimated = [Math]::Max([long]0, ([long]$after - [long]$before))
+                    $script:CacheCleanerSummary['DevCache'].EstimatedFreedBytes += $estimated
+                }
+                # 共享包装器负责检查退出码；若返回退出码，也显式保留失败信息。
+                $exitCode = $null
+                foreach ($result in $results) {
+                    $code = Get-CacheResultField $result @('ExitCode')
+                    if ($null -ne $code) { $exitCode = $code }
+                }
+                if ($null -ne $exitCode -and [int]$exitCode -ne 0) {
+                    throw ('官方命令失败，退出码 ' + $exitCode)
+                }
+                $script:CacheCleanerSummary['DevCache'].ProcessedCount++
+                $script:CacheCleanerSummary['DevCache'].Result = 'done'
+                Write-CacheAudit -Action 'CacheCommand/DevCache' -Path $exe -Result ('已执行 ' + $description + '；Bytes 为系统卷空闲变化估算') -Bytes $estimated
             }
-            finally {
-                # 成功、非零退出或抛错均重查根及祖先的重解析点；允许工具正常删除缓存根。
-                try { Assert-CacheDeveloperTarget -Name $tool['Name'] -Paths $paths }
-                catch { throw ('工具运行后路径安全校验失败：' + $_.Exception.Message) }
-            }
-            $after = Get-CacheSystemFreeBytes
-            $estimated = [long]0
-            if ($null -ne $before -and $null -ne $after) {
-                $estimated = [Math]::Max([long]0, ([long]$after - [long]$before))
-                $script:CacheCleanerSummary['DevCache'].EstimatedFreedBytes += $estimated
-            }
-            # 共享包装器负责检查退出码；若返回退出码，也显式保留失败信息。
-            $exitCode = $null
-            foreach ($result in $results) {
-                $code = Get-CacheResultField $result @('ExitCode')
-                if ($null -ne $code) { $exitCode = $code }
-            }
-            if ($null -ne $exitCode -and [int]$exitCode -ne 0) {
-                Add-CacheSkip 'DevCache' $description ('官方命令失败，退出码 ' + $exitCode)
-                continue
-            }
-            $script:CacheCleanerSummary['DevCache'].ProcessedCount++
-            Write-CacheAudit -Action 'CacheCommand/DevCache' -Path $exe -Result ('已执行 ' + $description + '；Bytes 为系统卷空闲变化估算') -Bytes $estimated
         }
         catch {
             Add-CacheSkip 'DevCache' $tool.Name $_.Exception.Message
@@ -525,6 +580,12 @@ foreach ($name in $script:CacheCleanerSummary.Keys) {
             Remove-CacheDirectoryChildren $name (Join-Path $cacheLocalAppData 'Microsoft\Windows\Explorer') 'thumbcache_*.db'
         }
         'BrowserCache' { Clear-CacheBrowsers }
+        { $_ -in @('AppCache', 'ShaderCache', 'InetCache') } { Clear-CacheWhitelistCategory $name }
+        'SystemLogs' {
+            try { Assert-Admin -Context $script:CacheCleanerContext -ErrorAction Stop }
+            catch { Add-CacheSkip $name $cacheSystemRoot ('系统日志清理需要管理员权限，已跳过整个类别：' + $_.Exception.Message); break }
+            Clear-CacheWhitelistCategory $name
+        }
         'DevCache' { Clear-CacheDeveloperTools }
     }
 }
@@ -539,7 +600,11 @@ foreach ($row in $script:CacheCleanerSummary.Values) {
     Write-Host ('[{0}] {1}；已处理 {2} 项；跳过 {3} 项。' -f $row.Category, $releaseText, $row.ProcessedCount, $row.SkippedCount)
     $summaryText = $releaseText + '；跳过项：' + (ConvertTo-Json -InputObject @($row.SkippedItems.ToArray()) -Compress -Depth 4)
     Write-CacheAudit -Action ('CacheSummary/' + $row.Category) -Path $row.Category -Result $summaryText -Bytes $summaryBytes
-    # 每个类别输出一个结构化对象，SkippedItems 保留具体路径和原因。
+    $row.FreedBytesEstimate = [long]$summaryBytes
+    $row.SkippedReasons = @($row.SkippedItems.ToArray() | ForEach-Object { $_.Reason } | Select-Object -Unique)
+    if (-not $row.WhatIf -and $row.SkippedCount -eq 0) { $row.Result = 'done' }
+    if ($row.Result -eq 'done' -and $row.SkippedCount -gt 0) { $row.Result = 'partial' }
+    # 保留原字段，每个类别仍只输出一个结构化对象，供后续编排器读取。
     Write-Output $row
 }
 if ($WhatIfPreference) {

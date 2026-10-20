@@ -770,6 +770,14 @@ function Test-SafeTarget {
                 if (-not $rootState.IsSafe) { continue }
                 if ($rootState.Exists -and ($rootState.Attributes -band [IO.FileAttributes]::Directory) -eq 0) { continue }
                 $relative = $match.Groups['Relative'].Value
+                # 排除项是根下的准确子名称；同时拒绝直接传入该子项或其任意后代。
+                foreach ($childName in $entry['ExcludeChildren']) {
+                    if ([string]::IsNullOrWhiteSpace([string]$childName) -or $childName -in @('.', '..') -or
+                        $childName -match '[\\/:*?\[\]]') { throw 'ExcludeChildren 必须是非空的单个子项名称。' }
+                    if ($relative -and ($relative.Split([char]'\')[0] -ieq $childName)) {
+                        throw ('白名单明确保留的子项：' + $childName)
+                    }
+                }
                 $allowed = $entry['Scope'] -eq 'Contents'
                 if ($entry['Scope'] -eq 'SelectedFiles') {
                     $allowed = [string]::IsNullOrEmpty($relative)
@@ -1135,6 +1143,7 @@ function Remove-SafeItem {
         类别名；MigrationOnly/ExternalOnly 类别拒绝直接删除。
     .PARAMETER MinAgeHours
         最少未修改小时数，默认 24；范围 0 到 876000。
+        SystemLogs 必须通过管理员检查，且有效下限始终至少为 168 小时。
     .PARAMETER Context
         原用户上下文。
     .EXAMPLE
@@ -1150,6 +1159,10 @@ function Remove-SafeItem {
     Assert-CleanerDeletionCategory -Category $Category
     if ([double]::IsNaN($MinAgeHours) -or [double]::IsInfinity($MinAgeHours)) { throw 'MinAgeHours 必须是有限数字。' }
     if ($null -eq $Context) { $Context = Get-CleanerContext }
+    if ($Category -eq 'SystemLogs') {
+        Assert-Admin -Context $Context
+        $MinAgeHours = [Math]::Max([double]168, $MinAgeHours)
+    }
     $skipped = [Collections.Generic.List[object]]::new()
     $stack = [Collections.Generic.Stack[object]]::new()
     [long]$released = 0; [long]$logicalRemoved = 0; [long]$plannedBytes = 0
