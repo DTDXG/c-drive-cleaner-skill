@@ -12,7 +12,7 @@
         @{ Id = 'system:UpdateCache'; Group = 'safe'; Title = '更新缓存'; Category = 'WindowsUpdate'; NeedsAdmin = $true; Loss = '' }
         @{ Id = 'system:DeliveryOptimization'; Group = 'safe'; Title = '更新缓存'; Category = 'DeliveryOptimization'; NeedsAdmin = $true; Loss = '' }
         @{ Id = 'system:CrashDumps'; Group = 'safe'; Title = '常见软件缓存'; Category = 'CrashDumpReports'; NeedsAdmin = $true; Loss = '' }
-        @{ Id = 'system:RecycleBin'; Group = 'confirm'; Title = '回收站'; Category = 'RecycleBin'; NeedsAdmin = $false; Loss = '清空后，里面已删除的文件将无法再从回收站恢复。' }
+        @{ Id = 'system:RecycleBin'; Group = 'confirm'; Title = '回收站'; Category = 'RecycleBin'; NeedsAdmin = $true; Loss = '清空后，里面已删除的文件将无法再从回收站恢复。' }
         @{ Id = 'system:Hibernate'; Group = 'confirm'; Title = '系统大文件'; Name = '休眠文件'; Path = '%SystemDrive%\hiberfil.sys'; NeedsAdmin = $true; Loss = '关闭后将不能使用休眠和快速启动；以后可以重新开启。' }
         @{ Id = 'system:WindowsOld'; Group = 'confirm'; Title = '系统大文件'; Name = '旧版系统文件'; Category = 'WindowsOld'; NeedsAdmin = $true; Loss = '删除后，将无法回退到之前的 Windows 版本。' }
         @{ Id = 'move:KnownFolder:Desktop'; Group = 'move'; Title = '用户文件夹'; Name = '桌面文件夹'; KnownFolder = 'Desktop'; NeedsAdmin = $false; Loss = '' }

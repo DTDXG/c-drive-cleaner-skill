@@ -79,10 +79,13 @@ Assert-Equal $byId['move:QQ'].Title $byId['move:WeChat'].Title '两种聊天数�
 Assert-Equal $byId['move:KnownFolder:Downloads'].Title '用户文件夹' '用户文件夹标题'
 Assert-Equal $byId['move:KnownFolder:Desktop'].Title $byId['move:KnownFolder:Downloads'].Title '用户文件夹同标题'
 Assert-Equal $byId['move:KnownFolder:Downloads'].Detail.Name '下载文件夹' '明细保留具体文件夹名'
-foreach ($id in @('cache:WindowsTemp', 'system:UpdateCache', 'system:DeliveryOptimization', 'system:Hibernate', 'system:WindowsOld')) {
-    Assert-True $byId[$id].NeedsAdmin "$id 需要管理员"
+Assert-True $byId['cache:WindowsTemp'].NeedsAdmin 'cache:WindowsTemp 需要管理员'
+# clean-system.ps1 除 PageFile 外均调用 Assert-Admin；体检清单中的系统项没有例外。
+foreach ($definition in @($data.Items | Where-Object { $_.Id -like 'system:*' })) {
+    $id = $definition.Id
+    Assert-Equal $definition.NeedsAdmin $true "$id 清单权限与系统清理处理器一致"
+    Assert-Equal $byId[$id].NeedsAdmin $true "$id 报告需要管理员"
 }
-Assert-True (-not $byId['system:RecycleBin'].NeedsAdmin) '原用户回收站无需管理员'
 Assert-True ($byId['system:RecycleBin'].Loss -match '无法.*恢复') '回收站后果'
 Assert-True ($byId['system:Hibernate'].Loss -match '休眠和快速启动') '休眠后果'
 Assert-True ($byId['system:WindowsOld'].Loss -match '无法回退') '旧版系统后果'
