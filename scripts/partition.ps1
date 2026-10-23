@@ -504,9 +504,16 @@ function Resolve-PcAfterShrink {
     return [pscustomobject]@{ Valid = (-not $reason); Reason = $reason; NewVolumes = @($adjusted); CAfterBytes = [long]$ActualC.Size }
 }
 
+function Test-PcNewPartitionLetter {
+    param([string]$Letter, $UsedLettersBefore)
+    # 缺少新建前的快照时，只允许无盘符；盘符本身永远不能作为新分区的身份证明。
+    return ($Letter -eq '' -or ($null -ne $UsedLettersBefore -and $Letter -match '^[D-Z]$' -and $Letter -notin $UsedLettersBefore))
+}
+
 function Test-PcCreatedSize {
-    param($Planned, $Actual)
-    return ($Actual.DiskNumber -eq $Planned.DiskNumber -and $Actual.PartitionNumber -gt 0 -and $Actual.DriveLetter -eq '' -and
+    param($Planned, $Actual, $UsedLettersBefore)
+    return ($Actual.DiskNumber -eq $Planned.DiskNumber -and $Actual.PartitionNumber -gt 0 -and
+        (Test-PcNewPartitionLetter $Actual.DriveLetter $UsedLettersBefore) -and
         [math]::Abs([decimal]$Actual.Offset - $Planned.Offset) -le 1MB -and
         $Actual.Size -le $Planned.Size -and $Actual.Size -ge ($Planned.Size - 16MB) -and $Actual.Size -ge 20GB)
 }
@@ -516,9 +523,12 @@ function Test-PcCreatedTarget {
         [string[]]$FileSystems, [string]$Letter = '')
     if ($null -eq $Target -or [string]::IsNullOrWhiteSpace($RunId)) { return $false }
     $records = @($Created | Where-Object { $_.RunId -ceq $RunId -and $_.Partition.DiskNumber -eq $Target.DiskNumber -and $_.Partition.PartitionNumber -eq $Target.PartitionNumber })
-    if ($records.Count -ne 1 -or $Target.IsSystem -or $Target.IsBoot -or $Target.IsHidden -or $Target.DriveLetter -ne $Letter -or $Target.FileSystem -notin $FileSystems) { return $false }
+    if ($records.Count -ne 1 -or $Target.IsSystem -or $Target.IsBoot -or $Target.IsHidden -or $Target.FileSystem -notin $FileSystems) { return $false }
+    $usedBefore = Get-PcValue $records[0] 'UsedLettersBefore'
+    if ($Letter) { if ($Target.DriveLetter -ne $Letter) { return $false } }
+    elseif (-not (Test-PcNewPartitionLetter $Target.DriveLetter $usedBefore)) { return $false }
     $r = $records[0].Partition
-    if ($r.DriveLetter -ne '' -or $r.FileSystem -notin @('', 'RAW')) { return $false }
+    if (-not (Test-PcNewPartitionLetter $r.DriveLetter $usedBefore) -or $r.FileSystem -notin @('', 'RAW')) { return $false }
     foreach ($field in @('Offset', 'Size')) { if ($r.$field -ne $Target.$field) { return $false } }
     foreach ($p in $PreExisting) {
         if ($p.DiskNumber -eq $Target.DiskNumber -and $p.PartitionNumber -eq $Target.PartitionNumber) { return $false }
@@ -546,15 +556,27 @@ function Get-PcLetterTakenReason {
     return ('计划的 ' + $Letter + ' 盘盘符已被占用，已停止；本次新建的文件盘仍没有盘符，未建立目录，请先检查当前布局，不要重复执行。')
 }
 
+function Resolve-PcPartitionLetter {
+    param([string]$CurrentLetter, [string]$PlannedLetter, [string[]]$UsedLetters)
+    $letter = $PlannedLetter; $reason = ''; $warning = ''
+    if ($CurrentLetter -ne $PlannedLetter -and $PlannedLetter -in $UsedLetters) {
+        if ($CurrentLetter) {
+            $letter = $CurrentLetter
+            $warning = '计划的 ' + $PlannedLetter + ' 盘盘符已被占用，新数据盘使用了 ' + $letter + ' 盘'
+        }
+        else { $reason = Get-PcLetterTakenReason $PlannedLetter }
+    }
+    return [pscustomobject]@{ Valid = (-not $reason); Reason = $reason; Letter = $letter
+        NeedsChange = ($CurrentLetter -ne $letter); Warning = $warning }
+}
+
 function Test-PcAssignLetter {
     param($Target, [object[]]$Created, [object[]]$PreExisting, [object[]]$Current, [string]$RunId,
         [string]$Letter, [string[]]$UsedLetters)
-    $reason = ''
     if ($Letter -notmatch '^[D-Z]$' -or -not (Test-PcCreatedTarget $Target $Created $PreExisting $Current $RunId @('NTFS'))) {
-        $reason = '无法核实本次新建且尚无盘符的文件盘，已停止分配盘符。'
+        return [pscustomobject]@{ Valid = $false; Reason = '无法核实本次新建的文件盘，已停止分配盘符。' }
     }
-    elseif ($Letter -in $UsedLetters) { $reason = Get-PcLetterTakenReason $Letter }
-    return [pscustomobject]@{ Valid = (-not $reason); Reason = $reason }
+    return Resolve-PcPartitionLetter $Target.DriveLetter $Letter $UsedLetters
 }
 
 function ConvertFrom-PcBitLockerStatus {
@@ -574,7 +596,7 @@ function Invoke-PcPartitionExecution {
     $runId = [guid]::NewGuid().ToString('N'); $steps = @(Get-PcPartitionSteps $PlanObject)
     $result = [pscustomobject]@{ Schema = 'pc-care/partition/1'; GeneratedAt = [datetimeoffset]::Now.ToString('o'); RunId = $runId
         UserSid = $Context.CurrentUserSid; Status = 'Done'; Reason = ''; StoppedAt = $null; Steps = @(); CreatedPartitions = @(); FinalLayout = @(); UnassignedFormattedPartitions = @()
-        CAfterBytes = $PlanObject.CAfterBytes; DiskNumber = $PlanObject.Disk.Number; NextStep = 'move' }
+        CAfterBytes = $PlanObject.CAfterBytes; DiskNumber = $PlanObject.Disk.Number; NextStep = 'move'; Warnings = @(); Volumes = @() }
     # 必须最先返回；连重新检查、日志、提权及外部只读工具也不能在演练时运行。
     if ($WhatIfPreference) {
         $result.Status = 'WhatIf'
@@ -588,7 +610,7 @@ function Invoke-PcPartitionExecution {
     }
     if (-not $PSCmdlet.ShouldProcess($PlanObject.Summary, '执行已在聊天中二次确认的分区方案')) { $result.Status = 'Skipped'; $result.Reason = '未执行分区。'; return $result }
     $disk = @($State.Disks | Where-Object { $_.Number -eq $PlanObject.Disk.Number })[0]
-    $preExisting = @($disk.Partitions); $working = @($PlanObject.NewVolumes); $created = @(); $active = 'Preflight'
+    $preExisting = @($disk.Partitions); $working = @($PlanObject.NewVolumes); $created = @(); $finalLetters = @{}; $active = 'Preflight'
     $system = @($State.Disks | Where-Object { $_.Number -eq $State.SystemDiskNumber })[0]
     $originalC = @($system.Partitions | Where-Object { $_.DriveLetter -eq 'C' })[0]
     try {
@@ -614,23 +636,24 @@ function Invoke-PcPartitionExecution {
                     $v = $working[$step.VolumeIndex]
                     $liveParts = @(Read-PcDiskPartitions $disk.Number)
                     foreach ($p in $liveParts) { if (Test-PcOverlap $v $p) { throw '新分区的位置已被占用，已停止。' } }
-                    if ($v.DriveLetter -in @(Read-PcUsedLetters)) { throw '计划的盘符已被占用，已停止。' }
+                    $usedBefore = @(Read-PcUsedLetters)
+                    if ($v.DriveLetter -in $usedBefore) { throw '计划的盘符已被占用，已停止。' }
                     $new = New-PcDataPartition $v
                     # New-Partition 返回的精确对象是本次创建证据；随后再独立读取一次。
-                    $created += [pscustomobject]@{ RunId = $runId; Partition = $new }
+                    $created += [pscustomobject]@{ RunId = $runId; Partition = $new; UsedLettersBefore = $usedBefore }
                     $result.CreatedPartitions = @($created); $record.Actual = $new
                     $actual = Read-PcPartition $new.DiskNumber $new.PartitionNumber
-                    $record.Actual = $actual
-                    if (-not (Test-PcCreatedSize $v $new) -or -not (Test-PcCreatedSize $v $actual) -or
+                    $record.Actual = $actual | Select-Object *
+                    if (-not (Test-PcCreatedSize $v $new $usedBefore) -or -not (Test-PcCreatedSize $v $actual $usedBefore) -or
                         $new.Offset -ne $actual.Offset -or $new.Size -ne $actual.Size -or $new.PartitionNumber -ne $actual.PartitionNumber) { throw '新分区的实际位置或大小超出允许差异，已停止，未格式化。' }
                 }
                 'FormatVolume' {
                     $entry = $created[$step.VolumeIndex]; $target = Read-PcPartition $entry.Partition.DiskNumber $entry.Partition.PartitionNumber
                     $current = @(Read-PcDiskPartitions $disk.Number)
                     if (-not (Test-PcFormatTarget $target $created $preExisting $current $runId)) { throw '不能证明目标分区由本次操作新建，已停止，未格式化。' }
-                    Format-PcNewVolume $target $working[$step.VolumeIndex].Label
+                    Format-PcNewVolume $target $working[$step.VolumeIndex].Label $entry.UsedLettersBefore
                     $formatted = Read-PcPartition $target.DiskNumber $target.PartitionNumber
-                    $record.Actual = $formatted
+                    $record.Actual = $formatted | Select-Object *
                     if (-not (Test-PcCreatedTarget $formatted $created $preExisting @(Read-PcDiskPartitions $disk.Number) $runId @('NTFS'))) { throw '新文件盘格式或位置未能核实，已停止。' }
                 }
                 'AssignLetter' {
@@ -639,16 +662,23 @@ function Invoke-PcPartitionExecution {
                     $current = @(Read-PcDiskPartitions $disk.Number)
                     $check = Test-PcAssignLetter $target $created $preExisting $current $runId $v.DriveLetter @(Read-PcUsedLetters)
                     if (-not $check.Valid) { throw $check.Reason }
-                    Set-PcPartitionLetter $target $v.DriveLetter
+                    [string]$finalLetter = $check.Letter
+                    if ($check.NeedsChange) { $finalLetter = Set-PcPartitionLetter $target $v.DriveLetter $entry.UsedLettersBefore }
                     $assigned = Read-PcPartition $target.DiskNumber $target.PartitionNumber
                     $record.Actual = $assigned
-                    if (-not (Test-PcCreatedTarget $assigned $created $preExisting @(Read-PcDiskPartitions $disk.Number) $runId @('NTFS') $v.DriveLetter)) { throw '新数据盘的盘符、格式、位置或大小未能核实，已停止建立目录。' }
+                    if ($finalLetter -notmatch '^[D-Z]$' -or -not (Test-PcCreatedTarget $assigned $created $preExisting @(Read-PcDiskPartitions $disk.Number) $runId @('NTFS') $finalLetter)) { throw '新数据盘的盘符、格式、位置或大小未能核实，已停止建立目录。' }
+                    $finalLetters[$step.VolumeIndex] = $finalLetter
+                    if ($finalLetter -ne $v.DriveLetter) {
+                        $choice = Resolve-PcPartitionLetter $finalLetter $v.DriveLetter @($v.DriveLetter)
+                        $record.Reason = $choice.Warning; $result.Warnings += $choice.Warning
+                    }
                 }
                 'CreateFolders' {
                     $v = $working[$step.VolumeIndex]; $entry = $created[$step.VolumeIndex]
                     $target = Read-PcPartition $entry.Partition.DiskNumber $entry.Partition.PartitionNumber
-                    if (-not (Test-PcCreatedTarget $target $created $preExisting @(Read-PcDiskPartitions $disk.Number) $runId @('NTFS') $v.DriveLetter)) { throw '新数据盘发生变化，已停止建立目录。' }
-                    foreach ($folder in $v.Folders) { New-PcVolumeFolder $v.DriveLetter $folder }
+                    $letter = $finalLetters[$step.VolumeIndex]
+                    if (-not (Test-PcCreatedTarget $target $created $preExisting @(Read-PcDiskPartitions $disk.Number) $runId @('NTFS') $letter)) { throw '新数据盘发生变化，已停止建立目录。' }
+                    foreach ($folder in $v.Folders) { New-PcVolumeFolder $letter $folder }
                     $record.Actual = $target
                 }
             }
@@ -666,6 +696,14 @@ function Invoke-PcPartitionExecution {
     }
     try { $result.FinalLayout = @(Read-PcDiskPartitions $disk.Number) }
     catch { if ($result.Status -eq 'Done') { $result.Status = 'Failed'; $result.StoppedAt = 'FinalLayout'; $result.Reason = '操作结束后无法读取完整布局，请先检查磁盘状态，不要重复执行。' } }
+    for ($i = 0; $i -lt $created.Count; $i++) {
+        $entry = $created[$i]; $v = $working[$i]
+        $matches = @($result.FinalLayout | Where-Object { $_.DiskNumber -eq $entry.Partition.DiskNumber -and
+            $_.PartitionNumber -eq $entry.Partition.PartitionNumber -and $_.Offset -eq $entry.Partition.Offset -and $_.Size -eq $entry.Partition.Size })
+        $letter = $null; if ($matches.Count -eq 1) { $letter = $matches[0].DriveLetter }
+        $result.Volumes += [pscustomobject]@{ DiskNumber = $entry.Partition.DiskNumber; PartitionNumber = $entry.Partition.PartitionNumber
+            Label = $v.Label; PlannedLetter = $v.DriveLetter; DriveLetter = $letter }
+    }
     $result.UnassignedFormattedPartitions = @($result.FinalLayout | Where-Object {
         $part = $_
         $part.FileSystem -eq 'NTFS' -and $part.DriveLetter -eq '' -and @($created | Where-Object {
@@ -830,13 +868,14 @@ function New-PcDataPartition {
 }
 
 function Format-PcNewVolume {
-    param($Partition, [string]$Label)
+    param($Partition, [string]$Label, $UsedLettersBefore)
     try {
         $p = Get-Partition -DiskNumber $Partition.DiskNumber -PartitionNumber $Partition.PartitionNumber -ErrorAction Stop
         $currentVolume = Get-Volume -Partition $p -ErrorAction Stop | Select-Object -First 1
         $live = ConvertTo-PcPartitionRecord $p $currentVolume
         if ($live.DiskNumber -ne $Partition.DiskNumber -or $live.PartitionNumber -ne $Partition.PartitionNumber -or
-            $live.Offset -ne $Partition.Offset -or $live.Size -ne $Partition.Size -or $live.DriveLetter -ne '' -or $Partition.DriveLetter -ne '' -or
+            $live.Offset -ne $Partition.Offset -or $live.Size -ne $Partition.Size -or
+            -not (Test-PcNewPartitionLetter $live.DriveLetter $UsedLettersBefore) -or -not (Test-PcNewPartitionLetter $Partition.DriveLetter $UsedLettersBefore) -or
             $live.IsSystem -or $live.IsBoot -or $live.IsHidden -or $live.FileSystem -notin @('', 'RAW')) { throw '目标不再是本次的新空分区。' }
         # 按精确分区对象传递，绝不使用可能已经换盘的盘符作为格式化目标。
         $null = Format-Volume -Partition $p -FileSystem NTFS -NewFileSystemLabel $Label -Confirm:$false -ErrorAction Stop
@@ -845,20 +884,24 @@ function Format-PcNewVolume {
 }
 
 function Set-PcPartitionLetter {
-    param($Partition, [string]$Letter)
+    param($Partition, [string]$Letter, $UsedLettersBefore)
     try {
         $p = Get-Partition -DiskNumber $Partition.DiskNumber -PartitionNumber $Partition.PartitionNumber -ErrorAction Stop
         $volume = Get-Volume -Partition $p -ErrorAction Stop | Select-Object -First 1
         $live = ConvertTo-PcPartitionRecord $p $volume
         if ($Letter -notmatch '^[D-Z]$' -or $live.DiskNumber -ne $Partition.DiskNumber -or $live.PartitionNumber -ne $Partition.PartitionNumber -or
-            $live.Offset -ne $Partition.Offset -or $live.Size -ne $Partition.Size -or $live.DriveLetter -ne '' -or $live.FileSystem -ne 'NTFS' -or
+            $live.Offset -ne $Partition.Offset -or $live.Size -ne $Partition.Size -or
+            -not (Test-PcNewPartitionLetter $live.DriveLetter $UsedLettersBefore) -or $live.FileSystem -ne 'NTFS' -or
             $live.IsSystem -or $live.IsBoot -or $live.IsHidden) { throw '目标发生变化。' }
-        $taken = $Letter -in @(Read-PcUsedLetters)
+        $choice = Resolve-PcPartitionLetter $live.DriveLetter $Letter @(Read-PcUsedLetters)
     }
     catch { throw '分配盘符前无法核实新文件盘或可用盘符，已停止；请先检查当前布局。' }
-    if ($taken) { throw (Get-PcLetterTakenReason $Letter) }
-    try { $null = Set-Partition -DiskNumber $Partition.DiskNumber -PartitionNumber $Partition.PartitionNumber -NewDriveLetter $Letter -Confirm:$false -ErrorAction Stop }
-    catch { throw '分配盘符失败，已停止；请先检查当前布局，不要重复执行。' }
+    if (-not $choice.Valid) { throw $choice.Reason }
+    if ($choice.NeedsChange) {
+        try { $null = Set-Partition -DiskNumber $Partition.DiskNumber -PartitionNumber $Partition.PartitionNumber -NewDriveLetter $Letter -Confirm:$false -ErrorAction Stop }
+        catch { throw '分配盘符失败，已停止；请先检查当前布局，不要重复执行。' }
+    }
+    return $choice.Letter
 }
 
 function New-PcVolumeFolder {

@@ -290,11 +290,11 @@ Assert-True (-not (Test-PcFormatTarget $target $records @($shrunk) @($shrunk, $c
 $steps = @(Get-PcPartitionSteps $p)
 Assert-Equal (($steps.Id) -join ',') 'ShrinkC,NewPartition,FormatVolume,AssignLetter,CreateFolders,NewPartition,FormatVolume,AssignLetter,CreateFolders' 'R2 执行步骤顺序：无盘符新建、格式化、分配盘符、目录'
 
-# R2：有盘符的原始分区也不能进入格式化，精确身份必须仍来自本次无盘符创建记录。
+# R2：缺少新建前快照时，带盘符的分区仍不能进入格式化。
 $lettered = Copy-TestObject $target; $lettered.DriveLetter = 'D'
-Assert-True (-not (Test-PcCreatedSize $v $lettered)) 'R2 新建回读必须无盘符'
+Assert-True (-not (Test-PcCreatedSize $v $lettered)) 'R2 缺少新建前快照时拒绝盘符'
 $letteredRecords = @(@{ RunId = 'this-run'; Partition = $lettered })
-Assert-True (-not (Test-PcFormatTarget $lettered $letteredRecords @($shrunk) @($shrunk, $lettered) 'this-run')) 'R2 即使记录匹配也拒绝带盘符的原始分区'
+Assert-True (-not (Test-PcFormatTarget $lettered $letteredRecords @($shrunk) @($shrunk, $lettered) 'this-run')) 'R2 即使身份匹配也要求盘符快照'
 foreach ($field in @('DiskNumber', 'PartitionNumber', 'Offset', 'Size')) {
     $wrong = Copy-TestObject $target; $wrong.$field += 1
     Assert-True (-not (Test-PcFormatTarget $wrong $records @($shrunk) @($shrunk, $wrong) 'this-run')) ('R2 创建身份不匹配拒绝 ' + $field)
@@ -308,11 +308,36 @@ Assert-True (-not (Test-PcAssignLetter $target $records @($shrunk) $current 'thi
 Assert-True (-not (Test-PcAssignLetter $formatted $records @($shrunk) @($shrunk, $formatted) 'other-run' 'D' @('C')).Valid) 'R2 分配盘符仍核对本次创建证据'
 Assert-True (-not (Test-PcAssignLetter $formatted $records @($shrunk) @($shrunk, $formatted) 'this-run' 'D' @('C', 'D')).Valid) 'R2 分配时盘符占用拒绝'
 
+# 自动盘符不能代替身份；仅允许新建前尚未占用的盘符。
+$autoRecords = @(@{ RunId = 'this-run'; Partition = (Copy-TestObject $lettered); UsedLettersBefore = @('C', 'X') })
+Assert-True (Test-PcCreatedSize $v $lettered @('C', 'X')) 'Auto 新建后自动盘符可通过大小检查'
+Assert-True (Test-PcFormatTarget $lettered $autoRecords @($shrunk) @($shrunk, $lettered) 'this-run') 'Auto 有本次记录及快照才允许格式化'
+$afterFormat = Copy-TestObject $formatted; $afterFormat.DriveLetter = 'G'
+Assert-True (Test-PcCreatedTarget $afterFormat $autoRecords @($shrunk) @($shrunk, $afterFormat) 'this-run' @('NTFS')) 'Auto 格式化后新自动盘符也通过'
+foreach ($field in @('DiskNumber', 'PartitionNumber', 'Offset', 'Size')) {
+    $wrong = Copy-TestObject $afterFormat; $wrong.$field += 1
+    Assert-True (-not (Test-PcCreatedTarget $wrong $autoRecords @($shrunk) @($shrunk, $wrong) 'this-run' @('NTFS'))) ('Auto 仍精确核对创建身份 ' + $field)
+}
+$oldLetter = Copy-TestObject $afterFormat; $oldLetter.DriveLetter = 'X'
+Assert-True (-not (Test-PcCreatedSize $v $oldLetter @('C', 'X'))) 'Auto 新建前已占用的盘符不接受'
+Assert-True (-not (Test-PcCreatedTarget $oldLetter $autoRecords @($shrunk) @($shrunk, $oldLetter) 'this-run' @('NTFS'))) 'Auto 格式化后也拒绝旧盘符'
+$oldRecord = @(@{ RunId = 'this-run'; Partition = (Copy-TestObject $lettered); UsedLettersBefore = @('C', 'D') })
+Assert-True (-not (Test-PcCreatedTarget $afterFormat $oldRecord @($shrunk) @($shrunk, $afterFormat) 'this-run' @('NTFS'))) 'Auto 创建记录中的旧盘符也拒绝'
+Assert-True (-not (Test-PcCreatedTarget $afterFormat $autoRecords @($shrunk) @($shrunk, $afterFormat) 'other-run' @('NTFS'))) 'Auto 不放松运行标识检查'
+$choice = Test-PcAssignLetter $afterFormat $autoRecords @($shrunk) @($shrunk, $afterFormat) 'this-run' 'D' @('C', 'G')
+Assert-True ($choice.Valid -and $choice.NeedsChange -and $choice.Letter -eq 'D') 'Auto 计划盘符空闲则改盘符'
+$choice = Test-PcAssignLetter $afterFormat $autoRecords @($shrunk) @($shrunk, $afterFormat) 'this-run' 'D' @('C', 'D', 'G')
+Assert-True ($choice.Valid -and -not $choice.NeedsChange -and $choice.Letter -eq 'G') 'Auto 计划盘符已占用则保留自动盘符'
+Assert-Equal $choice.Warning '计划的 D 盘盘符已被占用，新数据盘使用了 G 盘' 'Auto 中文警告'
+$sameLetter = Copy-TestObject $afterFormat; $sameLetter.DriveLetter = 'D'
+$choice = Test-PcAssignLetter $sameLetter $autoRecords @($shrunk) @($shrunk, $sameLetter) 'this-run' 'D' @('C', 'D')
+Assert-True ($choice.Valid -and -not $choice.NeedsChange -and -not $choice.Warning) 'Auto 已等于计划盘符则只核实'
+
 # 适配器假实现：覆盖整个执行器，不运行任何 Windows / 外部进程 / 日志写入。
 $script:sideEffects = @(); $script:fakeParts = @(); $script:shrinkDelta = 0; $script:newDelta = 0; $script:failAt = ''; $script:newOffsetDelta = 0
 function Write-PcPartitionLog { param($Step, $Status, $Message, $Context); $script:sideEffects += ('Log:' + $Status) }
 function Read-PcDiskPartitions { param($DiskNumber); return @($script:fakeParts) }
-function Read-PcUsedLetters { return @($script:fakeParts | Where-Object { $_.DriveLetter } | ForEach-Object { $_.DriveLetter }) }
+function Read-PcUsedLetters { return @($script:extraUsedLetters) + @($script:fakeParts | Where-Object { $_.DriveLetter } | ForEach-Object { $_.DriveLetter }) }
 function Read-PcPartition {
     param($DiskNumber, $PartitionNumber)
     if ($script:failAt -eq 'ReadNew' -and $PartitionNumber -gt 1) { throw '模拟创建后回读失败' }
@@ -328,31 +353,34 @@ function New-PcDataPartition {
     param($Volume)
     $script:sideEffects += 'New'
     if ($script:failAt -eq 'NewPartition') { throw '模拟创建失败' }
-    $new = New-TestPartition ($script:fakeParts.Count + 1) ($Volume.Offset + $script:newOffsetDelta) ($Volume.Size + $script:newDelta) '' $Volume.DiskNumber 'Basic' ''
+    $new = New-TestPartition ($script:fakeParts.Count + 1) ($Volume.Offset + $script:newOffsetDelta) ($Volume.Size + $script:newDelta) $script:autoNewLetter $Volume.DiskNumber 'Basic' ''
     $script:fakeParts += $new
     return Copy-TestObject $new
 }
 function Format-PcNewVolume {
-    param($Partition, $Label)
+    param($Partition, $Label, $UsedLettersBefore)
     $script:sideEffects += 'Format'
-    Assert-Equal $Partition.DriveLetter '' 'R2 格式化入口没有盘符'
+    Assert-True (Test-PcNewPartitionLetter $Partition.DriveLetter $UsedLettersBefore) 'R2/Auto 格式化入口盘符来自本次运行'
     if ($script:failAt -eq 'FormatVolume') { throw '模拟格式化失败' }
     $found = Read-PcPartition $Partition.DiskNumber $Partition.PartitionNumber; $found.FileSystem = 'NTFS'; $found.Label = $Label
+    if ($script:autoFormatLetter) { $found.DriveLetter = $script:autoFormatLetter }
 }
 function Set-PcPartitionLetter {
-    param($Partition, $Letter)
+    param($Partition, $Letter, $UsedLettersBefore)
     $script:sideEffects += 'Assign'
     if ($script:failAt -eq 'AssignLetter') { throw '模拟分配盘符失败' }
     $found = Read-PcPartition $Partition.DiskNumber $Partition.PartitionNumber
     Assert-Equal $found.FileSystem 'NTFS' 'R2 分配入口已经格式化'
-    Assert-Equal $found.DriveLetter '' 'R2 分配前保持无盘符'
+    Assert-True (Test-PcNewPartitionLetter $found.DriveLetter $UsedLettersBefore) 'R2/Auto 分配前盘符来自本次运行'
     $found.DriveLetter = $Letter
+    return $Letter
 }
-function New-PcVolumeFolder { param($Letter, $Name); $script:sideEffects += 'Folder'; if ($script:failAt -eq 'CreateFolders') { throw '模拟建目录失败' } }
+function New-PcVolumeFolder { param($Letter, $Name); $script:sideEffects += 'Folder'; $script:folderCalls += ($Letter + ':\' + $Name); if ($script:failAt -eq 'CreateFolders') { throw '模拟建目录失败' } }
 function Reset-TestExecution {
     param($State)
     $script:sideEffects = @(); $script:fakeParts = @((Copy-TestObject $State.Disks[0].Partitions[0]))
     $script:shrinkDelta = 0; $script:newDelta = 0; $script:failAt = ''; $script:newOffsetDelta = 0
+    $script:autoNewLetter = ''; $script:autoFormatLetter = ''; $script:extraUsedLetters = @(); $script:folderCalls = @()
 }
 $context = @{ IsAdmin = $true; CurrentUserSid = 'test-sid' }
 $s = New-TestState; $p = New-PcPartitionPlan $s; Reset-TestExecution $s
@@ -369,6 +397,84 @@ Assert-Equal $r.CreatedPartitions[0].Partition.Size ($p.NewVolumes[0].Size - 8MB
 Assert-Equal $r.CreatedPartitions[0].Partition.Offset ($p.NewVolumes[0].Offset + 33MB) 'P4 记录新卷实际对齐偏移'
 Assert-Equal $r.FinalLayout[2].Size ($p.NewVolumes[1].Size - 32MB - 8MB) 'P4 最后卷实际值'
 Assert-Equal @($script:sideEffects | Where-Object { $_ -eq 'Format' }).Count 2 '只格式化两个本次新卷'
+
+# Auto：完整执行覆盖创建时、回读时、格式化时的自动盘符和实际目录位置。
+foreach ($stage in @('NewPartition', 'ReadBack', 'FormatVolume')) {
+    & {
+        $s = New-TestState; $p = New-PcPartitionPlan $s '{"Count":1}'; Reset-TestExecution $s
+        switch ($stage) {
+            'NewPartition' { $script:autoNewLetter = 'G' }
+            'ReadBack' {
+                function Read-PcPartition {
+                    param($DiskNumber, $PartitionNumber)
+                    $found = @($script:fakeParts | Where-Object { $_.PartitionNumber -eq $PartitionNumber })[0]
+                    if ($PartitionNumber -gt 1 -and $found.FileSystem -eq '') { $found.DriveLetter = 'G' }
+                    return $found
+                }
+            }
+            'FormatVolume' { $script:autoFormatLetter = 'G' }
+        }
+        $r = Invoke-PcPartitionExecution $p $s $context -Confirm:$false
+        Assert-Equal $r.Status 'Done' ('Auto 完整执行成功 ' + $stage + '：' + $r.Reason)
+        $newStep = @($r.Steps | Where-Object { $_.Id -eq 'NewPartition' })[0]
+        $formatStep = @($r.Steps | Where-Object { $_.Id -eq 'FormatVolume' })[0]
+        if ($stage -ne 'FormatVolume') { Assert-Equal $newStep.Actual.DriveLetter 'G' ('Auto 新建 Actual 记录自动盘符 ' + $stage) }
+        else { Assert-Equal $newStep.Actual.DriveLetter '' 'Auto 格式化前仍无盘符' }
+        Assert-Equal $formatStep.Actual.DriveLetter 'G' ('Auto 格式化 Actual 记录自动盘符 ' + $stage)
+        Assert-Equal @($script:sideEffects | Where-Object { $_ -eq 'Assign' }).Count 1 ('Auto 空闲计划盘符只修改一次 ' + $stage)
+        Assert-Equal $r.Volumes[0].DriveLetter 'D' ('Auto 结果报告最终盘符 ' + $stage)
+        Assert-Equal $r.Volumes[0].PlannedLetter 'D' ('Auto 结果保留计划盘符 ' + $stage)
+        Assert-Equal $r.Warnings.Count 0 ('Auto 改为计划盘符无警告 ' + $stage)
+        Assert-Equal ($script:folderCalls -join '|') 'D:\文档|D:\下载|D:\图片视频|D:\聊天文件' ('Auto 改盘符后目录正确 ' + $stage)
+        Assert-Equal $r.CreatedPartitions[0].UsedLettersBefore[0] 'C' ('Auto 记录新建前快照 ' + $stage)
+    }
+}
+& {
+    $s = New-TestState; $p = New-PcPartitionPlan $s '{"Count":1}'; Reset-TestExecution $s; $script:autoNewLetter = 'D'
+    $r = Invoke-PcPartitionExecution $p $s $context -Confirm:$false
+    Assert-Equal $r.Status 'Done' 'Auto 自动盘符就是计划盘符则成功'
+    Assert-Equal @($script:sideEffects | Where-Object { $_ -eq 'Assign' }).Count 0 'Auto 已是计划盘符不调用修改'
+    Assert-Equal $r.Volumes[0].DriveLetter 'D' 'Auto 只核实也报告最终盘符'
+}
+& {
+    $s = New-TestState; $p = New-PcPartitionPlan $s; Reset-TestExecution $s; $script:autoNewLetter = 'G'
+    function Read-PcUsedLetters {
+        $letters = @($script:fakeParts | Where-Object { $_.DriveLetter } | ForEach-Object { $_.DriveLetter })
+        # 第一个分区格式化后，另一个设备才抢占计划的 D；第二个分区仍可正常完成。
+        if (@($script:fakeParts | Where-Object { $_.PartitionNumber -eq 2 -and $_.FileSystem -eq 'NTFS' }).Count -gt 0) { $letters += 'D' }
+        return $letters
+    }
+    function New-PcDataPartition {
+        param($Volume)
+        $script:sideEffects += 'New'
+        $letter = ''; if ($script:fakeParts.Count -eq 1) { $letter = 'G' }
+        $new = New-TestPartition ($script:fakeParts.Count + 1) $Volume.Offset $Volume.Size $letter $Volume.DiskNumber 'Basic' ''
+        $script:fakeParts += $new
+        return Copy-TestObject $new
+    }
+    $r = Invoke-PcPartitionExecution $p $s $context -Confirm:$false
+    Assert-Equal $r.Status 'Done' ('Auto 计划盘符占用仍完成所有卷：' + $r.Reason)
+    Assert-Equal $r.Warnings.Count 1 'Auto 结果只记录一个警告'
+    Assert-Equal $r.Warnings[0] '计划的 D 盘盘符已被占用，新数据盘使用了 G 盘' 'Auto 结果警告原文'
+    Assert-Equal @($r.Steps | Where-Object { $_.Id -eq 'AssignLetter' })[0].Actual.DriveLetter 'G' 'Auto 分配步骤 Actual 是保留盘符'
+    Assert-Equal ($r.Volumes.DriveLetter -join ',') 'G,E' 'Auto 逐卷报告最终盘符'
+    Assert-Equal ($r.Volumes.PlannedLetter -join ',') 'D,E' 'Auto 不修改冻结方案盘符'
+    Assert-Equal ($p.NewVolumes.DriveLetter -join ',') 'D,E' 'Auto 原方案未变'
+    Assert-Equal ($script:folderCalls -join '|') 'G:\文档|G:\下载|G:\图片视频|G:\聊天文件|E:\软件|E:\游戏' 'Auto 在保留的实际盘符建目录并继续下一卷'
+    Assert-Equal @($script:sideEffects | Where-Object { $_ -eq 'Assign' }).Count 1 'Auto 保留的盘符不修改，仅分配下一卷'
+    Assert-True ('G' -in $r.CreatedPartitions[1].UsedLettersBefore) 'Auto 每次新建前重新捕获快照，包含此前卷'
+}
+foreach ($stage in @('NewPartition', 'FormatVolume')) {
+    $s = New-TestState; $p = New-PcPartitionPlan $s '{"Count":1}'; Reset-TestExecution $s
+    $script:extraUsedLetters = @('X')
+    if ($stage -eq 'NewPartition') { $script:autoNewLetter = 'X' } else { $script:autoFormatLetter = 'X' }
+    $r = Invoke-PcPartitionExecution $p $s $context -Confirm:$false
+    Assert-Equal $r.Status 'Failed' ('Auto 旧盘符拒绝 ' + $stage)
+    Assert-Equal $r.StoppedAt ($stage + ':0') ('Auto 旧盘符在当前步骤停止 ' + $stage)
+    Assert-Equal $script:folderCalls.Count 0 ('Auto 旧盘符不建目录 ' + $stage)
+    if ($stage -eq 'NewPartition') { Assert-Equal @($script:sideEffects | Where-Object { $_ -eq 'Format' }).Count 0 'Auto 旧盘符创建回读后不进入格式化' }
+}
+$s = New-TestState; $p = New-PcPartitionPlan $s
 foreach ($failure in @('ShrinkC', 'NewPartition', 'FormatVolume', 'AssignLetter', 'CreateFolders')) {
     Reset-TestExecution $s; $script:failAt = $failure
     $r = Invoke-PcPartitionExecution $p $s $context -Confirm:$false
@@ -636,6 +742,7 @@ Assert-True (($output -join '') -match 'RESULT: .*fake-plan.json') '演练只引
                 'Offset' { $found.Offset += 1MB }
                 'Size' { $found.Size -= 1MB }
             }
+            return $Letter
         }
         $r = Invoke-PcPartitionExecution $p $s $context -Confirm:$false
         Assert-Equal $r.StoppedAt 'AssignLetter:0' ('R2 分配后精确校验 ' + $field)
@@ -684,11 +791,35 @@ Assert-True (($output -join '') -match 'RESULT: .*fake-plan.json') '演练只引
     try { Set-PcPartitionLetter $formatted 'D' } catch { $reason = $_.Exception.Message }
     Assert-True ($reason -match '盘符已被占用.*仍没有盘符') 'R2 最后一次竞争也返回中文无盘符原因'
     Assert-Equal $script:adapterAssignCalls 0 'R2 最后一次检查发现占用不调用 Set-Partition'
-    $taken = $false; Set-PcPartitionLetter $formatted 'D'
+    $taken = $false; $null = Set-PcPartitionLetter $formatted 'D'
     Assert-Equal $script:adapterAssignCalls 1 'R2 确认空闲后才分配'
     $reason = ''; try { Format-PcNewVolume $created '资料' } catch { $reason = $_.Exception.Message }
     Assert-True ([bool]$reason) 'R2 适配器也拒绝重复格式化'
     Assert-Equal $script:adapterFormatCalls 1 'R2 重复格式化没有调用 Windows 命令'
+
+    # Auto：实际 Windows 适配函数同样支持带盘符格式化、改盘符及最后一次检查发现占用时的保留。
+    $native.DriveLetter = 'G'; $volume.FileSystem = 'RAW'
+    $autoCreated = ConvertTo-PcPartitionRecord $native $null
+    Format-PcNewVolume $autoCreated '资料' @('C')
+    Assert-Equal $script:adapterFormatCalls 2 'Auto 适配器允许本次自动盘符格式化'
+    $autoFormatted = ConvertTo-PcPartitionRecord $native $volume
+    $taken = $true
+    Assert-Equal (Set-PcPartitionLetter $autoFormatted 'D' @('C')) 'G' 'Auto 最后一次检查发现占用时返回保留盘符'
+    Assert-Equal $script:adapterAssignCalls 1 'Auto 计划盘符被占用不调用 Set-Partition'
+    $taken = $false
+    Assert-Equal (Set-PcPartitionLetter $autoFormatted 'D' @('C')) 'D' 'Auto 适配器把自动盘符改为计划盘符'
+    Assert-Equal $script:adapterAssignCalls 2 'Auto 带盘符分区调用 Set-Partition 修改成功'
+    $taken = $true; $alreadyAssigned = ConvertTo-PcPartitionRecord $native $volume
+    Assert-Equal (Set-PcPartitionLetter $alreadyAssigned 'D' @('C')) 'D' 'Auto 适配器计划盘符已在本卷时只核实'
+    Assert-Equal $script:adapterAssignCalls 2 'Auto 已是计划盘符不修改'
+    $native.DriveLetter = 'X'; $volume.FileSystem = 'RAW'
+    $reason = ''; try { Format-PcNewVolume (ConvertTo-PcPartitionRecord $native $null) '资料' @('C', 'X') } catch { $reason = $_.Exception.Message }
+    Assert-True ([bool]$reason) 'Auto 适配器拒绝格式化新建前占用的盘符'
+    Assert-Equal $script:adapterFormatCalls 2 'Auto 旧盘符不调用 Format-Volume'
+    $volume.FileSystem = 'NTFS'; $reason = ''
+    try { $null = Set-PcPartitionLetter (ConvertTo-PcPartitionRecord $native $volume) 'D' @('C', 'X') } catch { $reason = $_.Exception.Message }
+    Assert-True ([bool]$reason) 'Auto 适配器拒绝修改新建前占用的盘符'
+    Assert-Equal $script:adapterAssignCalls 2 'Auto 旧盘符不调用 Set-Partition'
 }
 
 # R3a / P2：决定“布局致命、辅助安全检查待确认”的纯逻辑。
@@ -777,4 +908,4 @@ foreach ($read in @('DiskKind', 'BitLocker', 'MaxShrink')) {
         else { Assert-True ($r.Reason -match '先检查磁盘状态.*不要重复执行' -and $r.Reason -notmatch '未修改任何分区') 'R1 可能修改时保留检查布局提示' }
     }
 }
-Write-Host ("PASS t7-partition: {0} assertions; P1/P2/P3/P4; R1/R2/R3a/R3b; AST-only loading; fake storage; no script body executed." -f $script:assertions)
+Write-Host ("PASS t7-partition: {0} assertions; P1/P2/P3/P4; R1/R2/R3a/R3b; Auto; AST-only loading; fake storage; no script body executed." -f $script:assertions)
