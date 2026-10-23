@@ -382,12 +382,19 @@ function New-CleanAdminCommand {
     return ('$ErrorActionPreference = ''Stop''; try { ' + $command + '; exit 0 } catch { exit 1 }')
 }
 
+function Get-CleanElevationArguments {
+    param([string]$Command)
+    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($Command))
+    # 仅为本次子进程设置执行策略，不修改当前用户或整台电脑的策略。
+    return @('-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $encoded)
+}
+
 function Start-CleanAdminProcess {
     param([string]$Command)
     $executable = Join-Path $PSHOME 'pwsh.exe'
     if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) { $executable = Join-Path $PSHOME 'powershell.exe' }
-    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($Command))
-    $process = Start-Process -FilePath $executable -ArgumentList @('-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', $encoded) `
+    $arguments = @(Get-CleanElevationArguments $Command)
+    $process = Start-Process -FilePath $executable -ArgumentList $arguments `
         -Verb RunAs -Wait -PassThru -ErrorAction Stop
     try { return [int]$process.ExitCode }
     finally { $process.Dispose() }
@@ -396,10 +403,10 @@ function Start-CleanAdminProcess {
 function Merge-CleanAdminResult {
     param([object[]]$Items, $ChildResult, [string]$ExpectedSid, [guid]$RequestId,
         [int]$ExitCode = 0, [bool]$LaunchFailed = $false)
-    $reason = '没有获得管理员权限，已跳过'
+    $reason = '管理员清理步骤未正常完成，无法确认这些项目的清理结果'
+    if ($LaunchFailed) { $reason = '没有获得管理员权限，已跳过' }
     $valid = -not $LaunchFailed -and $ExitCode -eq 0
     if ($valid) {
-        $reason = '没有取得完整的管理员清理结果，暂时无法确认是否完成'
         $original = Get-CleanProperty $ChildResult 'OriginalUserSid' ''
         $current = Get-CleanProperty $ChildResult 'CurrentUserSid' ''
         $isAdmin = Get-CleanProperty $ChildResult 'IsAdmin' $false

@@ -198,12 +198,15 @@ foreach ($case in @('throw', 'exit', 'sid', 'original', 'request', 'schema', 'ph
     $merged = @(Merge-CleanAdminResult $admins $copy $context.OriginalUserSid $request $code $declined)
     Assert-Equal ($merged.Status -join ',') 'Skipped,Skipped,Skipped' "$case 不接受无效管理员结果"
     Assert-True ($merged[0].Reason -match '[\u4e00-\u9fff]') "$case 中文说明"
-    if ($case -in @('throw', 'exit', 'sid', 'original')) { Assert-True ($merged[0].Reason -match '没有获得.*管理员权限') "$case 权限未获得只跳过" }
+    if ($case -in @('throw', 'sid', 'original')) { Assert-True ($merged[0].Reason -match '没有获得.*管理员权限') "$case 权限未获得只跳过" }
+    else {
+        Assert-Equal $merged[0].Reason '管理员清理步骤未正常完成，无法确认这些项目的清理结果' "$case 已启动但结果无法确认"
+    }
 }
 
 $missingChild = @(Merge-CleanAdminResult $admins $null $context.OriginalUserSid $request)
 Assert-Equal $missingChild[0].Status 'Skipped' '子结果缺失不重试'
-Assert-True ($missingChild[0].Reason -match '无法确认是否完成') '子结果缺失不误称未取得权限'
+Assert-Equal $missingChild[0].Reason '管理员清理步骤未正常完成，无法确认这些项目的清理结果' '子结果缺失不误称未取得权限'
 
 # 结果写入使用内存流，验证 UTF-8 JSON 和未知计量，绝不创建磁盘文件。
 $memory = New-Object IO.MemoryStream
@@ -239,25 +242,73 @@ Assert-Equal $errors.Count 0 '管理员命令可解析'
 $calls = @($commandAst.FindAll({ param($n) $n -is [Management.Automation.Language.CommandAst] }, $true))
 Assert-Equal $calls.Count 1 '编码内容只调用自身脚本一次'
 & ([scriptblock]::Create($calls[0].Extent.Text))
-$encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command))
-Assert-Equal ([Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($encoded))) $command '跨进程编码完整保留中文和引号'
+$elevationArguments = @(Get-CleanElevationArguments $command)
+Assert-Equal $elevationArguments.Count 7 '提权宿主只有七个参数，不修改持久执行策略'
+Assert-Equal ($elevationArguments[0..5] -join ' ') '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand' '宿主执行策略在编码命令前且仅作用于子进程'
+Assert-Equal ([Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($elevationArguments[-1]))) $command '跨进程编码完整保留中文和引号'
 
 # 使用假 Start-Process 验证真实适配器传入 RunAs、Wait 和完整编码命令。
 & {
-    function Test-Path { param($LiteralPath, $PathType); return $true }
+    function Test-Path { param($LiteralPath, $PathType); return $script:hasPwsh }
     function Start-Process {
         param($FilePath, $ArgumentList, [string]$Verb, [switch]$Wait, [switch]$PassThru, $ErrorAction)
         Assert-Equal $Verb 'RunAs' '通过系统权限确认提权'
         Assert-True ($Wait -and $PassThru) '等待一次子进程并读取退出码'
+        Assert-Equal $FilePath (Join-Path $PSHOME $script:expectedHost) '支持两种 Windows 宿主'
+        Assert-Equal ($ArgumentList -join ' ') ($elevationArguments -join ' ') '真实启动器使用纯函数生成的全部参数'
         Assert-Equal $ArgumentList[-2] '-EncodedCommand' '通过编码命令传递数组'
         Assert-Equal ([Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($ArgumentList[-1]))) $command '子进程参数完整'
         $fakeProcess = [pscustomobject]@{ ExitCode = 0 }
         $fakeProcess | Add-Member -MemberType ScriptMethod -Name Dispose -Value { $script:disposed = $true }
         return $fakeProcess
     }
-    $script:disposed = $false
-    Assert-Equal (Start-CleanAdminProcess $command) 0 '读取系统子进程退出码'
-    Assert-True $script:disposed '释放进程对象'
+    foreach ($hostName in @('pwsh.exe', 'powershell.exe')) {
+        $script:expectedHost = $hostName; $script:hasPwsh = $hostName -eq 'pwsh.exe'
+        $script:disposed = $false
+        Assert-Equal (Start-CleanAdminProcess $command) 0 '读取系统子进程退出码'
+        Assert-True $script:disposed '释放进程对象'
+    }
+}
+
+# 真实提权适配器与合并流程之间只替换系统启动和读取边界；所有事件均在内存中。
+& {
+    function Test-Path { param($LiteralPath, $PathType); return $true }
+    function Start-Process {
+        param($FilePath, $ArgumentList, $Verb, [switch]$Wait, [switch]$PassThru, $ErrorAction)
+        $script:launchCount++
+        if ($script:phaseCase -eq 'declined') { throw '用户拒绝授权' }
+        if ($script:phaseCase -eq 'launch') { throw '无法启动程序' }
+        $code = 0
+        if ($script:phaseCase -eq 'exit') { $code = 1 }
+        $process = [pscustomobject]@{ ExitCode = $code }
+        $process | Add-Member -MemberType ScriptMethod -Name Dispose -Value { $script:phaseDisposed = $true }
+        return $process
+    }
+    function Read-CleanJsonFile {
+        param($Path)
+        $script:readCount++
+        if ($script:phaseCase -eq 'missing') { throw '结果缺失或无法读取' }
+        return @{ Value = @{ Schema = 'invalid' } }
+    }
+    foreach ($case in @('declined', 'launch', 'exit', 'missing', 'invalid')) {
+        $script:phaseCase = $case; $script:launchCount = 0; $script:readCount = 0; $script:phaseDisposed = $false
+        $rows = @(Invoke-CleanElevatedPhase $admins $context '/fake/clean.ps1' '/fake/report.json' '/fake/child.json' $request)
+        Assert-Equal $script:launchCount 1 "$case 只启动一次，不重试清理"
+        $expectedReason = '管理员清理步骤未正常完成，无法确认这些项目的清理结果'
+        $expectedReads = 0
+        if ($case -in @('declined', 'launch')) { $expectedReason = '没有获得管理员权限，已跳过' }
+        else { Assert-True $script:phaseDisposed "$case 释放已启动进程" }
+        if ($case -in @('missing', 'invalid')) { $expectedReads = 1 }
+        Assert-Equal $script:readCount $expectedReads "$case 只在正常退出后读取结果"
+        Assert-Equal $rows.Count $admins.Count "$case 保留全部管理员项目"
+        foreach ($row in $rows) {
+            Assert-Equal $row.Status 'Skipped' "$case 不报告清理成功"
+            Assert-Equal $row.Reason $expectedReason "$case 准确说明启动失败或结果未知"
+            Assert-Equal $row.FreedBytes $null "$case 不确认腾出空间"
+            Assert-Equal $row.FreeBefore $null "$case 不确认清理前空间"
+            Assert-Equal $row.FreeAfter $null "$case 不确认清理后空间"
+        }
+    }
 }
 
 $script:events = @(); $script:measurements = 0
