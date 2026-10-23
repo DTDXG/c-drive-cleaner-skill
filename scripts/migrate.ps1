@@ -808,7 +808,11 @@ function Read-MigrationManifest {
         if ($Required) { throw '联接清单不存在。' }
         return [pscustomobject]@{ Version = 1; UserSid = $script:MigrationSid; Entries = @() }
     }
-    $document = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop
+    # 后台阶段可与只读状态查询并行；读取快照时允许原子替换清单。
+    $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+    $reader = $null
+    try { $reader = [IO.StreamReader]::new($stream, [Text.Encoding]::UTF8); $document = ConvertFrom-Json -InputObject $reader.ReadToEnd() -ErrorAction Stop }
+    finally { if ($null -ne $reader) { $reader.Dispose() }; $stream.Dispose() }
     if ((Get-MigrationValue $document @('Version')) -ne 1 -or
         (Get-MigrationValue $document @('UserSid')) -ne $script:MigrationSid -or
         $null -eq $document.PSObject.Properties['Entries']) { throw '清单版本、所属用户或格式无效。' }
@@ -840,7 +844,7 @@ function Write-MigrationManifest {
     [System.IO.File]::WriteAllText($temporary, $json, $encoding)
     Assert-MigrationTarget $temporary 'MigrationManifest'
     Assert-MigrationTarget $Path 'MigrationManifest'
-    if (Test-Path -LiteralPath $Path) { [System.IO.File]::Replace($temporary, $Path, $null) }
+    if (Test-Path -LiteralPath $Path) { [System.IO.File]::Replace($temporary, $Path, [System.Management.Automation.Language.NullString]::Value) }
     else { [System.IO.File]::Move($temporary, $Path) }
 }
 
