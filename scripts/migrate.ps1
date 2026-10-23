@@ -119,6 +119,7 @@ param(
     [switch]$VerifyHash
 )
 
+Set-StrictMode -Version 2.0
 if ($env:OS -ne 'Windows_NT') { throw '此脚本只能在 Windows 上运行。' }
 . (Join-Path $PSScriptRoot "common.ps1")
 
@@ -226,7 +227,7 @@ function Assert-MigrationSeparation {
         $new.StartsWith($old + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
         throw '源与目标必须分离，不能相同或互为父子目录。'
     }
-    if ([System.IO.Path]::GetPathRoot($old) -ieq [System.IO.Path]::GetPathRoot($new)) {
+    if ($old.Substring(0, 2) -ieq $new.Substring(0, 2)) {
         throw '迁移目标必须位于另一个本地数据卷。'
     }
 }
@@ -807,7 +808,11 @@ function Read-MigrationManifest {
         if ($Required) { throw '联接清单不存在。' }
         return [pscustomobject]@{ Version = 1; UserSid = $script:MigrationSid; Entries = @() }
     }
-    $document = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop
+    # 后台阶段可与只读状态查询并行；读取快照时允许原子替换清单。
+    $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+    $reader = $null
+    try { $reader = [IO.StreamReader]::new($stream, [Text.Encoding]::UTF8); $document = ConvertFrom-Json -InputObject $reader.ReadToEnd() -ErrorAction Stop }
+    finally { if ($null -ne $reader) { $reader.Dispose() }; $stream.Dispose() }
     if ((Get-MigrationValue $document @('Version')) -ne 1 -or
         (Get-MigrationValue $document @('UserSid')) -ne $script:MigrationSid -or
         $null -eq $document.PSObject.Properties['Entries']) { throw '清单版本、所属用户或格式无效。' }
@@ -839,19 +844,21 @@ function Write-MigrationManifest {
     [System.IO.File]::WriteAllText($temporary, $json, $encoding)
     Assert-MigrationTarget $temporary 'MigrationManifest'
     Assert-MigrationTarget $Path 'MigrationManifest'
-    if (Test-Path -LiteralPath $Path) { [System.IO.File]::Replace($temporary, $Path, $null) }
+    if (Test-Path -LiteralPath $Path) { [System.IO.File]::Replace($temporary, $Path, [System.Management.Automation.Language.NullString]::Value) }
     else { [System.IO.File]::Move($temporary, $Path) }
 }
 
 function Open-MigrationManifestLock {
-    param([string]$Path)
+    param([string]$Path, [switch]$Persistent)
     $parent = [System.IO.Path]::GetDirectoryName($Path)
     Assert-MigrationTarget $parent 'MigrationManifest'
     $null = [System.IO.Directory]::CreateDirectory($parent)
     $lockPath = $Path + '.lock'
     Assert-MigrationTarget $lockPath 'MigrationManifest'
-    $stream = New-Object System.IO.FileStream -ArgumentList @($lockPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
-    return [pscustomobject]@{ Path = $lockPath; Stream = $stream }
+    $mode = [System.IO.FileMode]::CreateNew
+    if ($Persistent) { $mode = [System.IO.FileMode]::OpenOrCreate }
+    $stream = New-Object System.IO.FileStream -ArgumentList @($lockPath, $mode, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+    return [pscustomobject]@{ Path = $lockPath; Stream = $stream; Persistent = [bool]$Persistent }
 }
 
 function Close-MigrationManifestLock {
@@ -860,7 +867,7 @@ function Close-MigrationManifestLock {
     try {
         $Lock.Stream.Dispose()
         Assert-MigrationTarget $Lock.Path 'MigrationManifest'
-        [System.IO.File]::Delete($Lock.Path)
+        if (-not (Get-MigrationValue $Lock @('Persistent') $false)) { [System.IO.File]::Delete($Lock.Path) }
     }
     catch {
         Write-Warning ('未能移除本次清单锁 {0}：{1}。确认没有迁移进程运行后才可人工移除锁文件。' -f $Lock.Path, $_.Exception.Message)
@@ -905,7 +912,7 @@ function Get-MigrationVerifiedJunction {
     $targets = @(Get-MigrationValue $entry @('Target') @())
     if ($targets.Count -ne 1) { throw '联接目标不唯一。' }
     $actualTarget = [string]$targets[0]
-    if ($actualTarget.StartsWith('\??\')) { $actualTarget = $actualTarget.Substring(4) }
+    if ($actualTarget.StartsWith(('\' + [char]63 + [char]63 + '\'))) { $actualTarget = $actualTarget.Substring(4) }
     if ($actualTarget.TrimEnd('\') -ine $Target) { throw '联接原始目标与清单规范路径不一致，拒绝删除。' }
     $actualTarget = Get-MigrationFullPath $actualTarget
     if ($actualTarget -ine $Target) { throw '联接目标与清单不一致，拒绝删除。' }

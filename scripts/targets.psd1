@@ -41,6 +41,26 @@
         '%VOLUME%\EFI', '%VOLUME%\$Recycle.Bin', '%VOLUME%\$WINDOWS.~BT', '%VOLUME%\$WINDOWS.~WS'
     )
 
+    # 只把已识别的聊天数据根交给搬家；不扩大现有缓存联接白名单。
+    MoveChats = @{
+        WeChat = @{
+            Names = @('WeChat Files', 'xwechat_files')
+            RegistryKey = 'Software\Tencent\WeChat'; RegistryName = 'FileSavePath'
+            Configs = @(
+                @{ Path = '%APPDATA%\Tencent\WeChat\All Users\config\3ebffe94.ini'; Format = 'Text' }
+                @{ Path = '%APPDATA%\Tencent\xwechat\config.json'; Format = 'Json' }
+            )
+        }
+        QQ = @{
+            Names = @('Tencent Files', 'QQNT', 'qq_nt')
+            RegistryKey = 'Software\Tencent\QQNT'; RegistryName = 'DataPath'
+            Configs = @(
+                @{ Path = '%APPDATA%\Tencent\QQ\nt_data\global\nt_qq\nt_qq_config.json'; Format = 'Json' }
+                @{ Path = '%APPDATA%\Tencent\QQ\nt_data\global\nt_qq\config.json'; Format = 'Json' }
+            )
+        }
+    }
+
     Categories = @{
         UserFolder = @{
             RequiresOriginalUser = $true; ExternalOnly = $true; MigrationOnly = $true
@@ -73,6 +93,18 @@
             RequiresOriginalUser = $true; ExternalOnly = $true; MigrationOnly = $true
             # 改名后仅当安全的同根保留副本存在时，允许缓存根暂时缺失。
             AllowMissing = $false; TargetSource = 'DevCache'; Targets = @()
+        }
+        MoveChat = @{
+            RequiresOriginalUser = $true; ExternalOnly = $true; MigrationOnly = $true
+            AllowMissing = $true; TargetSource = 'MoveChat'; Targets = @()
+        }
+        MoveChatBackup = @{
+            RequiresOriginalUser = $true; ExternalOnly = $true; MigrationOnly = $true
+            AllowMissing = $true; TargetSource = 'MoveChatBackup'; Targets = @()
+        }
+        MoveChatParent = @{
+            RequiresOriginalUser = $true; ExternalOnly = $true; MigrationOnly = $true
+            AllowMissing = $false; TargetSource = 'MoveChatParent'; Targets = @()
         }
         MigrationDestination = @{
             RequiresOriginalUser = $true; ExternalOnly = $true; MigrationOnly = $true

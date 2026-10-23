@@ -41,9 +41,9 @@ function Get-CleanerNativeType {
     param()
     if ($null -ne $script:CleanerNativeType) { return $script:CleanerNativeType }
     if (-not (Test-CleanerWindows)) { throw '此安全库仅支持 Windows。' }
-    $existing = 'CDriveCleaner.NativeV2' -as [type]
+    $existing = 'CDriveCleaner.NativeV4' -as [type]
     if ($null -ne $existing) { $script:CleanerNativeType = $existing; return $existing }
-    $name = [Reflection.AssemblyName]::new('CDriveCleaner.NativeV2')
+    $name = [Reflection.AssemblyName]::new('CDriveCleaner.NativeV4')
     if ($null -ne [Reflection.Emit.AssemblyBuilder].GetMethod('DefineDynamicAssembly', [type[]]@([Reflection.AssemblyName], [Reflection.Emit.AssemblyBuilderAccess]))) {
         $assembly = [Reflection.Emit.AssemblyBuilder]::DefineDynamicAssembly($name, [Reflection.Emit.AssemblyBuilderAccess]::Run)
     }
@@ -51,14 +51,17 @@ function Get-CleanerNativeType {
         $assembly = [AppDomain]::CurrentDomain.DefineDynamicAssembly($name, [Reflection.Emit.AssemblyBuilderAccess]::Run)
     }
     $module = $assembly.DefineDynamicModule('Native')
-    $builder = $module.DefineType('CDriveCleaner.NativeV2', [Reflection.TypeAttributes]'Public, Abstract, Sealed')
+    $builder = $module.DefineType('CDriveCleaner.NativeV4', [Reflection.TypeAttributes]'Public, Abstract, Sealed')
     $definitions = @(
+        @{ Name = 'GetVolumeNameForVolumeMountPointW'; Return = [bool]; Parameters = [type[]]@([string], [Text.StringBuilder], [uint32]) }
         @{ Name = 'GetLongPathNameW'; Return = [uint32]; Parameters = [type[]]@([string], [Text.StringBuilder], [uint32]) }
         @{ Name = 'CreateFileW'; Return = [Microsoft.Win32.SafeHandles.SafeFileHandle]; Parameters = [type[]]@([string], [uint32], [uint32], [IntPtr], [uint32], [uint32], [IntPtr]) }
         @{ Name = 'GetFileInformationByHandle'; Return = [bool]; Parameters = [type[]]@([Microsoft.Win32.SafeHandles.SafeFileHandle], [IntPtr]) }
         @{ Name = 'GetFileInformationByHandleEx'; Return = [bool]; Parameters = [type[]]@([Microsoft.Win32.SafeHandles.SafeFileHandle], [int], [IntPtr], [uint32]) }
         @{ Name = 'GetFinalPathNameByHandleW'; Return = [uint32]; Parameters = [type[]]@([Microsoft.Win32.SafeHandles.SafeFileHandle], [Text.StringBuilder], [uint32], [uint32]) }
+        @{ Name = 'DeviceIoControl'; Return = [bool]; Parameters = [type[]]@([Microsoft.Win32.SafeHandles.SafeFileHandle], [uint32], [IntPtr], [uint32], [byte[]], [uint32], [uint32].MakeByRefType(), [IntPtr]) }
         @{ Name = 'SetFileInformationByHandle'; Return = [bool]; Parameters = [type[]]@([Microsoft.Win32.SafeHandles.SafeFileHandle], [int], [IntPtr], [uint32]) }
+        @{ Name = 'SHSetKnownFolderPath'; Library = 'shell32.dll'; Return = [int]; Parameters = [type[]]@([guid].MakeByRefType(), [uint32], [IntPtr], [string]) }
         @{ Name = 'SHGetKnownFolderPath'; Library = 'shell32.dll'; Return = [int]; Parameters = [type[]]@([guid].MakeByRefType(), [uint32], [IntPtr], [IntPtr].MakeByRefType()) }
     )
     $attributeType = [Runtime.InteropServices.DllImportAttribute]
@@ -74,6 +77,7 @@ function Get-CleanerNativeType {
         if ($definition.ContainsKey('Library')) { $library = $definition['Library'] }
         $attribute = [Reflection.Emit.CustomAttributeBuilder]::new($constructor, [object[]]@($library), $fields, $values)
         $method.SetCustomAttribute($attribute)
+        if ($definition['Name'] -eq 'DeviceIoControl') { $null=$method.DefineParameter(5,[Reflection.ParameterAttributes]::Out,'outputBuffer') }
         $method.SetImplementationFlags([Reflection.MethodImplAttributes]::PreserveSig)
     }
     $script:CleanerNativeType = $builder.CreateType()
@@ -529,6 +533,140 @@ function Get-CleanerWSLPath {
     finally { if ($null -ne $key) { $key.Dispose() } }
 }
 
+function Resolve-CleanerChatPaths {
+    # 与 checkup Resolve-CheckupChatPaths 一致：旧微信配置是父目录，JSON 为准确数据根。
+    param([string]$Value, [string[]]$Names, [bool]$IsParent)
+    $path = ConvertTo-CleanerCanonicalPath -LiteralPath $Value
+    if (-not $IsParent -or $path.Substring($path.LastIndexOf('\') + 1) -in $Names) { return $path }
+    foreach ($name in $Names) { $path + '\' + $name }
+}
+
+function ConvertFrom-CleanerChatConfig {
+    param([string]$Text, [string]$Format)
+    if ($Format -eq 'Text') {
+        foreach ($line in ($Text -split '[\r\n\x00]+')) {
+            $value = $line.Trim().Trim([char]'"')
+            if ($value -match '^[A-Za-z]:[\\/]') { $value }
+        }
+        return
+    }
+    $stack = [Collections.Generic.Stack[object]]::new()
+    $stack.Push(@{ Value = (ConvertFrom-Json -InputObject $Text); Depth = 0 })
+    while ($stack.Count -gt 0) {
+        $node = $stack.Pop()
+        if ($null -eq $node.Value -or $node.Depth -gt 6) { continue }
+        foreach ($property in $node.Value.PSObject.Properties) {
+            if ($property.Name -in @('fileSavePath','file_save_path','savePath','dataPath','data_dir','userDataPath','filePath') -and
+                $property.Value -is [string]) { $property.Value }
+            elseif ($property.Value -is [pscustomobject]) { $stack.Push(@{ Value = $property.Value; Depth = $node.Depth + 1 }) }
+        }
+    }
+}
+
+function Read-CleanerChatConfig {
+    param([string]$Path)
+    $chain = Test-CleanerPathChain -LiteralPath $Path
+    if (-not $chain.IsSafe) { throw '聊天软件的设置文件无法安全读取。' }
+    $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+    try {
+        $buffer = New-Object byte[] 65537; $length = 0
+        while ($length -lt $buffer.Length) {
+            $read = $stream.Read($buffer, $length, $buffer.Length - $length)
+            if ($read -eq 0) { break }; $length += $read
+        }
+        if ($length -gt 65536) { throw '聊天软件的设置文件过大，无法确认存储位置。' }
+        if ($length -ge 2 -and $buffer[0] -eq 255 -and $buffer[1] -eq 254) { return [Text.Encoding]::Unicode.GetString($buffer, 2, $length - 2) }
+        if ($length -ge 2 -and $buffer[0] -eq 254 -and $buffer[1] -eq 255) { return [Text.Encoding]::BigEndianUnicode.GetString($buffer, 2, $length - 2) }
+        $text = ''
+        try { $text = [Text.UTF8Encoding]::new($false, $true).GetString($buffer, 0, $length) }
+        catch { $text = [Text.Encoding]::GetEncoding([Globalization.CultureInfo]::CurrentCulture.TextInfo.ANSICodePage).GetString($buffer, 0, $length) }
+        return $text.TrimStart([char]0xfeff)
+    }
+    finally { $stream.Dispose() }
+}
+
+function Get-CleanerChatRootRecognition {
+    # 仅直属、非链接目录是标记；不递归，不凭通用 filePath 键授权用户数据。
+    param([string]$Path,[string]$App,[string[]]$Names,[scriptblock]$Children)
+    if ($Path.Substring($Path.LastIndexOf('\')+1) -in $Names) {return 'Name'}
+    foreach ($entry in (& $Children $Path)) {
+        if (($entry.Attributes -band [IO.FileAttributes]::Directory) -eq 0 -or ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {continue}
+        $name=$entry.Name
+        if (($App -eq 'WeChat' -and ($name -eq 'All Users' -or $name -match '^wxid_[A-Za-z0-9_-]+$')) -or
+            ($App -eq 'QQ' -and ($name -eq 'nt_qq' -or $name -match '^[1-9][0-9]{4,11}$'))) {return 'Marker'}
+    }
+    return ''
+}
+
+function Get-CleanerChatMarkerChildren {
+    param([string]$Path)
+    # 包括根本身的安全校验，不沿自定义根的链接读取目标。
+    $check=Test-CleanerPathChain -LiteralPath $Path
+    if ($check.IsSafe -and $check.Exists) {([IO.DirectoryInfo]::new($Path)).EnumerateDirectories()}
+}
+
+function Get-CleanerChatRoots {
+    param($Context, $KnownFolders,
+        [scriptblock]$ReadRegistry = { param($key,$name) Get-CleanerRegistryValue -Hive ([Microsoft.Win32.Registry]::Users) -SubKey $key -Name $name },
+        [scriptblock]$ReadConfig = { param($path) Read-CleanerChatConfig $path },
+        [scriptblock]$Exists = { param($path) $null -ne (Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue) }, [switch]$IncludeMissing,
+        [scriptblock]$MarkerChildren={param($p) Get-CleanerChatMarkerChildren $p},
+        $Issues=$null)
+    if ($null -eq $KnownFolders) { $KnownFolders = Get-CleanerKnownFolderMap -Context $Context }
+    $seen = @{}; $recognitions=@{}
+    foreach ($app in @('WeChat','QQ')) {
+        $definition = (Get-CleanerTargets).MoveChats[$app]
+        $candidates = [Collections.Generic.List[string]]::new()
+        if ($KnownFolders.ContainsKey('Documents')) {
+            $names = @('Tencent Files'); if ($app -eq 'WeChat') { $names = @('WeChat Files','xwechat_files') }
+            foreach ($name in $names) { $candidates.Add($KnownFolders.Documents + '\' + $name) }
+        }
+        $custom = [Collections.Generic.List[object]]::new()
+        $value = & $ReadRegistry ($Context.OriginalUserSid + '\' + $definition.RegistryKey) $definition.RegistryName
+        if ($value -is [string] -and $value) { $custom.Add(@{ Value = $value; Parent = ($app -eq 'WeChat') }) }
+        foreach ($config in $definition.Configs) {
+            try {
+                $text = & $ReadConfig (Expand-CleanerPath -Pattern $config.Path -Context $Context)
+                foreach ($value in @(ConvertFrom-CleanerChatConfig $text $config.Format)) { $custom.Add(@{ Value = $value; Parent = ($config.Format -eq 'Text') }) }
+            }
+            catch { } # 只采用能可靠读取的配置，和体检相同，不猜测其他路径。
+        }
+        foreach ($entry in $custom) {
+            try {
+                $expanded = Expand-CleanerPath -Pattern $entry.Value -Context $Context
+                foreach ($path in @(Resolve-CleanerChatPaths $expanded $definition.Names $entry.Parent)) {
+                    if ($path -in $KnownFolders.Values) {if($null -ne $Issues){$Issues.Add('找到了自定义的聊天文件位置，但无法确认，暂不搬家')};continue}
+                    if (-not (Get-CleanerForbiddenReason -LiteralPath $path -Context $Context) -and
+                        -not (Get-CleanerMigrationForbiddenReason -LiteralPath $path -Context $Context)) {
+                        $recognition=Get-CleanerChatRootRecognition $path $app $definition.Names $MarkerChildren
+                        if (-not $recognition -and $IncludeMissing) {
+                            # 改名后仅以同父目录中精确的保留副本确认标记；不跟随原位置的链接。
+                            $parent=$path.Substring(0,$path.LastIndexOf('\'));$leaf=$path.Substring($path.LastIndexOf('\')+1)
+                            foreach ($sibling in (& $MarkerChildren $parent)) {
+                                if ($sibling.Name -match ('^'+[regex]::Escape($leaf)+'\.cdrive-retained-[0-9a-f]{32}$') -and
+                                    ($sibling.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) {
+                                    $recognition=Get-CleanerChatRootRecognition $sibling.FullName $app $definition.Names $MarkerChildren
+                                    if ($recognition) {break}
+                                }
+                            }
+                        }
+                        if ($recognition) {$candidates.Add($path);$recognitions[$app+'|'+$path]=$recognition}
+                        elseif ($null -ne $Issues) {$Issues.Add('找到了自定义的聊天文件位置，但无法确认，暂不搬家')}
+                    }
+                }
+            }
+            catch {if($null -ne $Issues){$Issues.Add('找到了自定义的聊天文件位置，但无法确认，暂不搬家')}}
+        }
+        foreach ($path in $candidates) {
+            $key = $app + '|' + $path
+            if (-not $seen.ContainsKey($key) -and ($IncludeMissing -or (& $Exists $path))) {
+                $seen[$key] = $true
+                [pscustomobject]@{ App = $app; Path = $path; Recognition=$(if($recognitions.ContainsKey($key)){$recognitions[$key]}else{'Default'}) }
+            }
+        }
+    }
+}
+
 function Get-CleanerMigrationTarget {
     # 此处只派生路径数据，不创建目录、读清单内容或授权删除。
     param($Definition, $Context)
@@ -538,6 +676,15 @@ function Get-CleanerMigrationTarget {
         'KnownFolders' {
             foreach ($path in (Get-CleanerKnownFolderMap -Context $Context).Values) {
                 $entries.Add(@{ Path = $path; Scope = 'Contents' })
+            }
+        }
+        { $_ -in @('MoveChat','MoveChatBackup','MoveChatParent') } {
+            foreach ($chat in @(Get-CleanerChatRoots -Context $Context -IncludeMissing)) {
+                switch ($Definition['TargetSource']) {
+                    'MoveChat' { $entries.Add(@{ Path = $chat.Path; Scope = 'Contents' }) }
+                    'MoveChatBackup' { $entries.Add(@{ Path = $chat.Path; Scope = 'Container'; SuffixRegex = '\.cdrive-retained-[0-9a-f]{32}' }) }
+                    'MoveChatParent' { $entries.Add(@{ Path = $chat.Path.Substring(0,$chat.Path.LastIndexOf('\')); Scope = 'Container' }) }
+                }
             }
         }
         'ApplicationFiles' {
@@ -574,6 +721,7 @@ function Get-CleanerMigrationTarget {
             $reason = Get-CleanerForbiddenReason -LiteralPath $directory -Context $Context
             if ($reason) { throw $reason }
             $entries.Add(@{ Path = $directory; Scope = 'Container' })
+            $entries.Add(@{ Path = ($directory + '\move-inventory-'); Scope = 'File'; SuffixRegex = '[0-9a-f]{32}(?:-v(?:[2-9][0-9]*|1[0-9]+))?\.tsv' })
             $entries.Add(@{ Path = ($directory + '\*.json'); Scope = 'File'; SuffixRegex = '(?:\.tmp-[0-9a-f]{32}|\.lock)?' })
         }
         'RegisteredWSL' {
@@ -604,6 +752,17 @@ function Test-CleanerRetainedCache {
         if ($item.FullName -notmatch ('^(?:' + [regex]::Escape($LiteralPath) + ')\.cdrive-retained-[0-9a-f]{32}$')) { continue }
         $check = Test-SafeTarget -LiteralPath $item.FullName -Category JunctionBackup -Context $Context
         if ($check.IsSafe -and $check.Exists) { return $true }
+    }
+    return $false
+}
+
+function Test-CleanerRetainedChat {
+    param([string]$LiteralPath,$Context)
+    $parent=$LiteralPath.Substring(0,$LiteralPath.LastIndexOf('\'))
+    foreach ($item in @(Get-CleanerChildren -LiteralPath $parent)) {
+        if ($item.FullName -notmatch ('^'+[regex]::Escape($LiteralPath)+'\.cdrive-retained-[0-9a-f]{32}$')) {continue}
+        $check=Test-SafeTarget -LiteralPath $item.FullName -Category MoveChatBackup -Context $Context
+        if ($check.IsSafe -and $check.Exists) {return $true}
     }
     return $false
 }
@@ -672,6 +831,11 @@ function Test-CleanerMigrationTarget {
     }
     if ($entryMatch['Scope'] -eq 'File' -and $null -ne $snapshot) {
         if ($snapshot.IsDirectory -or $snapshot.LinkCount -ne 1) { throw '配置或清单必须是普通单链接文件。' }
+    }
+    if ($Category -eq 'MoveChat' -and -not $chain.Exists) {
+        if ($path -ine $rootPath -or -not (Test-CleanerRetainedChat -LiteralPath $rootPath -Context $Context)) {
+            throw '原聊天文件夹缺失且没有可核实的保留副本。'
+        }
     }
     if ($Category -eq 'Junction' -and -not $chain.Exists) {
         if ($path -ine $rootPath -or -not (Test-CleanerRetainedCache -LiteralPath $rootPath -Context $Context)) {
@@ -1262,7 +1426,9 @@ function Invoke-External {
         [Parameter(Mandatory = $true)][string]$Description,
         [Alias('AllowedExitCodes', 'AcceptExitCodes')][int[]]$SuccessExitCodes = @(0),
         $Context,
-        [System.Text.Encoding]$OutputEncoding
+        [System.Text.Encoding]$OutputEncoding,
+        [ValidateSet('Junction','MoveChat')][string]$JunctionCategory = 'Junction',
+        [scriptblock]$OutputLine, [scriptblock]$ProgressCallback
     )
     if ($null -eq $Context) { $Context = Get-CleanerContext }
     if ($ArgumentList.Count -gt 0) {
@@ -1327,7 +1493,7 @@ function Invoke-External {
         if ($linkPath -match '[%!^&|<>()"\r\n]' -or $targetPath -match '[%!^&|<>()"\r\n]') { throw '联接路径包含不安全的 cmd 元字符。' }
         $linkPath = ConvertTo-CleanerCanonicalPath -LiteralPath $linkPath
         $targetPath = ConvertTo-CleanerCanonicalPath -LiteralPath $targetPath
-        $linkCheck = Test-SafeTarget -LiteralPath $linkPath -Category Junction -Context $Context
+        $linkCheck = Test-SafeTarget -LiteralPath $linkPath -Category $JunctionCategory -Context $Context
         if (-not $linkCheck.IsSafe -or $linkCheck.Exists -or $linkCheck.Path -ine $linkCheck.RootPath) {
             throw '联接源必须是有安全保留副本的缺失白名单缓存根。'
         }
@@ -1351,10 +1517,24 @@ function Invoke-External {
     try {
         Write-CleanerAudit -Action External -Path $resolved -Result Started -Message $Description -Context $Context
         if (-not $process.Start()) { throw '无法启动外部程序。' }
-        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stdoutTask = $null
+        if ($null -eq $OutputLine) { $stdoutTask = $process.StandardOutput.ReadToEndAsync() }
         $stderrTask = $process.StandardError.ReadToEndAsync()
-        $process.WaitForExit()
-        $stdout = $stdoutTask.GetAwaiter().GetResult(); $stderr = $stderrTask.GetAwaiter().GetResult()
+        $stdout = ''
+        if ($null -ne $OutputLine) {
+            $lineTask = $process.StandardOutput.ReadLineAsync()
+            while ($null -ne $lineTask) {
+                if ($lineTask.Wait(500)) {
+                    $line = $lineTask.GetAwaiter().GetResult()
+                    if ($null -eq $line) { $lineTask = $null }
+                    else { $null = & $OutputLine $line; $lineTask = $process.StandardOutput.ReadLineAsync() }
+                }
+                if ($null -ne $ProgressCallback) { $null = & $ProgressCallback }
+            }
+        }
+        while (-not $process.WaitForExit(1000)) { if ($null -ne $ProgressCallback) { $null = & $ProgressCallback } }
+        if ($null -ne $stdoutTask) { $stdout = $stdoutTask.GetAwaiter().GetResult() }
+        $stderr = $stderrTask.GetAwaiter().GetResult()
         $exitCode = $process.ExitCode
         $success = $SuccessExitCodes -contains $exitCode
         $result = [pscustomobject]@{ FilePath = $resolved; ArgumentList = $ArgumentList; ExitCode = $exitCode; Success = $success; Skipped = $false; WasWhatIf = $false; RebootRequired = ($exitCode -eq 3010); StandardOutput = $stdout; StandardError = $stderr; Output = $stdout }
