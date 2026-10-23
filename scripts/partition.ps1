@@ -20,7 +20,8 @@ param(
     [Parameter(Mandatory = $true, ParameterSetName = 'Apply')][string]$PlanPath,
     [Parameter(ParameterSetName = 'Apply')][string]$ResultPath,
     [Parameter(ParameterSetName = 'Apply')][string]$OriginalUserSid,
-    [Parameter(ParameterSetName = 'Apply')][switch]$ElevatedChild
+    [Parameter(ParameterSetName = 'Apply')][switch]$ElevatedChild,
+    [Parameter(ParameterSetName = 'Apply', DontShow = $true)][hashtable]$ChildState
 )
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
@@ -213,26 +214,51 @@ function Get-PcSafety {
         $value = Get-PcValue $Disk $field
         if ($value -eq $true) { $blockers += '这块硬盘使用了特殊的磁盘组合或管理方式，本版本不处理，请保留现有布局。' }
         elseif ($null -eq $value) {
-            if ($AtApply) { $blockers += '获得权限后仍无法确认硬盘是否使用特殊的磁盘组合或管理方式，已停止。' }
-            else { $pending += '执行前会再确认硬盘是否使用特殊的磁盘组合或管理方式。' }
+            $failure = Get-PcReadFailure 'DiskKind' $AtApply
+            if ($failure.Fatal) { $blockers += $failure.Reason } else { $pending += $failure.Reason }
         }
     }
     if ($Disk.BusType -in @('RAID', 'Spaces')) { $blockers += '这块硬盘使用了多盘组合或存储池，本版本不处理。' }
     if ($Shrink) {
         if ($BlockEncrypted -and $State.BitLocker -eq 'Protected') { $blockers += 'C 盘已开启磁盘加密，本版本暂不压缩，请先备份并保留现有分区。' }
         elseif ($BlockEncrypted -and $State.BitLocker -ne 'Off') {
-            if ($AtApply) { $blockers += '获得权限后仍无法确认 C 盘加密状态，不能安全压缩。' }
-            else { $pending += '执行前会再确认 C 盘的磁盘加密状态。' }
+            $failure = Get-PcReadFailure 'BitLocker' $AtApply
+            if ($failure.Fatal) { $blockers += $failure.Reason } else { $pending += $failure.Reason }
         }
         if ($null -eq $State.MaxShrinkBytes) {
-            if ($AtApply) { $blockers += '获得权限后仍无法读取 Windows 允许分出的最大空间，不能压缩。' }
+            $failure = Get-PcReadFailure 'MaxShrink' $AtApply
+            if ($failure.Fatal) { $blockers += $failure.Reason }
             else {
-                $pending += '执行前会再确认 Windows 允许分出的最大空间。'
+                $pending += $failure.Reason
                 $warnings += '当前按剩余空间估算，最终可分出的大小将在执行前由 Windows 确认；不足时会停止。'
             }
         }
     }
     return [pscustomobject]@{ Blockers = @($blockers | Select-Object -Unique); PendingChecks = @($pending | Select-Object -Unique); Warnings = @($warnings) }
+}
+
+function Get-PcReadFailure {
+    param([string]$Read, [bool]$AtApply = $false)
+    # 布局及盘符是规划依据，缺失即停止；仅辅助安全检查可留待提权后确认。
+    $pending = ''; $reason = '无法完整读取硬盘布局或盘符，暂时不能规划；需要获得管理员权限后重新检查。'
+    switch ($Read) {
+        'DiskKind' { $pending = '执行前会再确认硬盘是否使用特殊的磁盘组合或管理方式。'; $reason = '获得权限后仍无法确认硬盘是否使用特殊的磁盘组合或管理方式，已停止。' }
+        'BitLocker' { $pending = '执行前会再确认 C 盘的磁盘加密状态。'; $reason = '获得权限后仍无法确认 C 盘加密状态，不能安全压缩。' }
+        'MaxShrink' { $pending = '执行前会再确认 Windows 允许分出的最大空间。'; $reason = '获得权限后仍无法读取 Windows 允许分出的最大空间，不能压缩。' }
+    }
+    $fatal = $AtApply -or -not $pending
+    if (-not $fatal) { $reason = $pending }
+    return [pscustomobject]@{ Fatal = [bool]$fatal; NeedsElevatedRead = (-not $AtApply); Reason = $reason }
+}
+
+function New-PcUnavailablePlan {
+    param([string]$Sid, [datetimeoffset]$Now = [datetimeoffset]::Now)
+    $failure = Get-PcReadFailure 'Layout'
+    return [pscustomobject]@{ Schema = 'pc-care/partition-plan/1'; GeneratedAt = $Now.ToString('o'); UserSid = $Sid
+        Disk = $null; Fingerprint = ''; Situation = 'Unknown'; Mode = 'None'; Feasible = $false; NeedsElevatedRead = $failure.NeedsElevatedRead
+        Blockers = @($failure.Reason); PendingChecks = @(); Warnings = @(); Before = @(); After = @(); CAfterBytes = $null
+        NewVolumes = @(); PurposeMappings = @(); UsableBytes = $null; Summary = $failure.Reason; RequiresSecondChatConfirmation = $true
+        NextStep = 'partition'; Advice = '请先确认管理员权限，再重新检查硬盘布局；当前未修改任何分区。' }
 }
 
 function Get-PcRecoveryWarning {
@@ -347,7 +373,7 @@ function New-PcPartitionPlan {
     if ($blockers.Count -gt 0) { $summary = '暂时不能执行分区方案：' + ($blockers | Select-Object -First 1) }
     return [pscustomobject]@{ Schema = 'pc-care/partition-plan/1'; GeneratedAt = $Now.ToString('o'); UserSid = [string](Get-PcValue $State 'UserSid' '')
         Disk = [pscustomobject]@{ Number = [int]$disk.Number; UniqueId = $disk.UniqueId; SerialNumber = $disk.SerialNumber; Size = [long]$disk.Size; PartitionStyle = $disk.PartitionStyle }
-        Fingerprint = Get-PcFingerprint $State $disk.Number; Situation = $situation; Mode = $mode; Feasible = ($blockers.Count -eq 0)
+        Fingerprint = Get-PcFingerprint $State $disk.Number; Situation = $situation; Mode = $mode; Feasible = ($blockers.Count -eq 0); NeedsElevatedRead = ($pending.Count -gt 0)
         Blockers = @($blockers | Select-Object -Unique); PendingChecks = @($pending | Select-Object -Unique); Warnings = @($warnings | Select-Object -Unique)
         Before = @($before); After = @($after); CAfterBytes = $cAfter; NewVolumes = @($new); PurposeMappings = @($mappings)
         UsableBytes = $usable; Summary = $summary; RequiresSecondChatConfirmation = $true
@@ -448,8 +474,8 @@ function Get-PcPartitionSteps {
     }
     for ($i = 0; $i -lt @($PlanObject.NewVolumes).Count; $i++) {
         $v = $PlanObject.NewVolumes[$i]
-        foreach ($id in @('NewPartition', 'FormatVolume', 'CreateFolders')) {
-            $text = '新建分区'; if ($id -eq 'FormatVolume') { $text = '把本次新分区建立为 NTFS 文件盘' }; if ($id -eq 'CreateFolders') { $text = '建立分类目录' }
+        foreach ($id in @('NewPartition', 'FormatVolume', 'AssignLetter', 'CreateFolders')) {
+            $text = '新建分区'; if ($id -eq 'FormatVolume') { $text = '把本次新分区建立为 NTFS 文件盘' }; if ($id -eq 'AssignLetter') { $text = '分配盘符并核实新数据盘' }; if ($id -eq 'CreateFolders') { $text = '建立分类目录' }
             [pscustomobject]@{ Id = $id; VolumeIndex = $i; Description = ($text + '：' + $v.DriveLetter + ' 盘（' + $v.Label + '）') }
         }
     }
@@ -480,18 +506,20 @@ function Resolve-PcAfterShrink {
 
 function Test-PcCreatedSize {
     param($Planned, $Actual)
-    return ($Actual.DiskNumber -eq $Planned.DiskNumber -and $Actual.DriveLetter -eq $Planned.DriveLetter -and
+    return ($Actual.DiskNumber -eq $Planned.DiskNumber -and $Actual.PartitionNumber -gt 0 -and $Actual.DriveLetter -eq '' -and
         [math]::Abs([decimal]$Actual.Offset - $Planned.Offset) -le 1MB -and
         $Actual.Size -le $Planned.Size -and $Actual.Size -ge ($Planned.Size - 16MB) -and $Actual.Size -ge 20GB)
 }
 
-function Test-PcFormatTarget {
-    param($Target, [object[]]$Created, [object[]]$PreExisting, [object[]]$Current, [string]$RunId)
+function Test-PcCreatedTarget {
+    param($Target, [object[]]$Created, [object[]]$PreExisting, [object[]]$Current, [string]$RunId,
+        [string[]]$FileSystems, [string]$Letter = '')
     if ($null -eq $Target -or [string]::IsNullOrWhiteSpace($RunId)) { return $false }
     $records = @($Created | Where-Object { $_.RunId -ceq $RunId -and $_.Partition.DiskNumber -eq $Target.DiskNumber -and $_.Partition.PartitionNumber -eq $Target.PartitionNumber })
-    if ($records.Count -ne 1 -or $Target.IsSystem -or $Target.IsBoot -or $Target.IsHidden -or $Target.DriveLetter -eq 'C' -or $Target.FileSystem -notin @('', 'RAW')) { return $false }
+    if ($records.Count -ne 1 -or $Target.IsSystem -or $Target.IsBoot -or $Target.IsHidden -or $Target.DriveLetter -ne $Letter -or $Target.FileSystem -notin $FileSystems) { return $false }
     $r = $records[0].Partition
-    foreach ($field in @('Offset', 'Size', 'DriveLetter')) { if ($r.$field -ne $Target.$field) { return $false } }
+    if ($r.DriveLetter -ne '' -or $r.FileSystem -notin @('', 'RAW')) { return $false }
+    foreach ($field in @('Offset', 'Size')) { if ($r.$field -ne $Target.$field) { return $false } }
     foreach ($p in $PreExisting) {
         if ($p.DiskNumber -eq $Target.DiskNumber -and $p.PartitionNumber -eq $Target.PartitionNumber) { return $false }
         if (Test-PcOverlap $Target $p) { return $false }
@@ -508,6 +536,27 @@ function Test-PcFormatTarget {
     return $true
 }
 
+function Test-PcFormatTarget {
+    param($Target, [object[]]$Created, [object[]]$PreExisting, [object[]]$Current, [string]$RunId)
+    return Test-PcCreatedTarget $Target $Created $PreExisting $Current $RunId @('', 'RAW')
+}
+
+function Get-PcLetterTakenReason {
+    param([string]$Letter)
+    return ('计划的 ' + $Letter + ' 盘盘符已被占用，已停止；本次新建的文件盘仍没有盘符，未建立目录，请先检查当前布局，不要重复执行。')
+}
+
+function Test-PcAssignLetter {
+    param($Target, [object[]]$Created, [object[]]$PreExisting, [object[]]$Current, [string]$RunId,
+        [string]$Letter, [string[]]$UsedLetters)
+    $reason = ''
+    if ($Letter -notmatch '^[D-Z]$' -or -not (Test-PcCreatedTarget $Target $Created $PreExisting $Current $RunId @('NTFS'))) {
+        $reason = '无法核实本次新建且尚无盘符的文件盘，已停止分配盘符。'
+    }
+    elseif ($Letter -in $UsedLetters) { $reason = Get-PcLetterTakenReason $Letter }
+    return [pscustomobject]@{ Valid = (-not $reason); Reason = $reason }
+}
+
 function ConvertFrom-PcBitLockerStatus {
     param([string]$Text)
     # 保护暂停仍可能是加密盘：必须同时证实完全解密和保护关闭。
@@ -521,10 +570,10 @@ function ConvertFrom-PcBitLockerStatus {
 
 function Invoke-PcPartitionExecution {
     [CmdletBinding(SupportsShouldProcess = $true)]
-    param($PlanObject, $State, $Context, [bool]$BlockEncrypted = $true)
+    param($PlanObject, $State, $Context, [bool]$BlockEncrypted = $true, [hashtable]$ChildState)
     $runId = [guid]::NewGuid().ToString('N'); $steps = @(Get-PcPartitionSteps $PlanObject)
     $result = [pscustomobject]@{ Schema = 'pc-care/partition/1'; GeneratedAt = [datetimeoffset]::Now.ToString('o'); RunId = $runId
-        UserSid = $Context.CurrentUserSid; Status = 'Done'; Reason = ''; StoppedAt = $null; Steps = @(); CreatedPartitions = @(); FinalLayout = @()
+        UserSid = $Context.CurrentUserSid; Status = 'Done'; Reason = ''; StoppedAt = $null; Steps = @(); CreatedPartitions = @(); FinalLayout = @(); UnassignedFormattedPartitions = @()
         CAfterBytes = $PlanObject.CAfterBytes; DiskNumber = $PlanObject.Disk.Number; NextStep = 'move' }
     # 必须最先返回；连重新检查、日志、提权及外部只读工具也不能在演练时运行。
     if ($WhatIfPreference) {
@@ -548,6 +597,8 @@ function Invoke-PcPartitionExecution {
             $record = [pscustomobject]@{ Id = $step.Id; VolumeIndex = $step.VolumeIndex; Description = $step.Description; Status = 'Started'; Actual = $null; Reason = '' }
             $result.Steps += $record
             Write-PcPartitionLog $active 'Started' $step.Description $Context
+            # 与提权包装器共享，只在可能触及磁盘的步骤开始时置位；异常退出后仍不能误报“未修改”。
+            if ($null -ne $ChildState) { $ChildState.StepMayHaveRun = $true }
             switch ($step.Id) {
                 'InitializeDisk' { Initialize-PcDisk $disk.Number; $record.Actual = Read-PcDisk $disk.Number }
                 'ShrinkC' {
@@ -580,14 +631,23 @@ function Invoke-PcPartitionExecution {
                     Format-PcNewVolume $target $working[$step.VolumeIndex].Label
                     $formatted = Read-PcPartition $target.DiskNumber $target.PartitionNumber
                     $record.Actual = $formatted
-                    if ($formatted.FileSystem -ne 'NTFS' -or $formatted.Offset -ne $target.Offset -or $formatted.Size -ne $target.Size -or
-                        $formatted.DriveLetter -ne $target.DriveLetter) { throw '新文件盘格式或位置未能核实，已停止。' }
+                    if (-not (Test-PcCreatedTarget $formatted $created $preExisting @(Read-PcDiskPartitions $disk.Number) $runId @('NTFS'))) { throw '新文件盘格式或位置未能核实，已停止。' }
+                }
+                'AssignLetter' {
+                    $v = $working[$step.VolumeIndex]; $entry = $created[$step.VolumeIndex]
+                    $target = Read-PcPartition $entry.Partition.DiskNumber $entry.Partition.PartitionNumber
+                    $current = @(Read-PcDiskPartitions $disk.Number)
+                    $check = Test-PcAssignLetter $target $created $preExisting $current $runId $v.DriveLetter @(Read-PcUsedLetters)
+                    if (-not $check.Valid) { throw $check.Reason }
+                    Set-PcPartitionLetter $target $v.DriveLetter
+                    $assigned = Read-PcPartition $target.DiskNumber $target.PartitionNumber
+                    $record.Actual = $assigned
+                    if (-not (Test-PcCreatedTarget $assigned $created $preExisting @(Read-PcDiskPartitions $disk.Number) $runId @('NTFS') $v.DriveLetter)) { throw '新数据盘的盘符、格式、位置或大小未能核实，已停止建立目录。' }
                 }
                 'CreateFolders' {
                     $v = $working[$step.VolumeIndex]; $entry = $created[$step.VolumeIndex]
                     $target = Read-PcPartition $entry.Partition.DiskNumber $entry.Partition.PartitionNumber
-                    if ($target.Offset -ne $entry.Partition.Offset -or $target.Size -ne $entry.Partition.Size -or
-                        $target.DriveLetter -ne $v.DriveLetter -or $target.FileSystem -ne 'NTFS') { throw '新数据盘发生变化，已停止建立目录。' }
+                    if (-not (Test-PcCreatedTarget $target $created $preExisting @(Read-PcDiskPartitions $disk.Number) $runId @('NTFS') $v.DriveLetter)) { throw '新数据盘发生变化，已停止建立目录。' }
                     foreach ($folder in $v.Folders) { New-PcVolumeFolder $v.DriveLetter $folder }
                     $record.Actual = $target
                 }
@@ -606,6 +666,14 @@ function Invoke-PcPartitionExecution {
     }
     try { $result.FinalLayout = @(Read-PcDiskPartitions $disk.Number) }
     catch { if ($result.Status -eq 'Done') { $result.Status = 'Failed'; $result.StoppedAt = 'FinalLayout'; $result.Reason = '操作结束后无法读取完整布局，请先检查磁盘状态，不要重复执行。' } }
+    $result.UnassignedFormattedPartitions = @($result.FinalLayout | Where-Object {
+        $part = $_
+        $part.FileSystem -eq 'NTFS' -and $part.DriveLetter -eq '' -and @($created | Where-Object {
+            $_.Partition.DiskNumber -eq $part.DiskNumber -and $_.Partition.PartitionNumber -eq $part.PartitionNumber -and
+            $_.Partition.Offset -eq $part.Offset -and $_.Partition.Size -eq $part.Size
+        }).Count -eq 1
+    })
+    if ($result.UnassignedFormattedPartitions.Count -gt 0 -and $result.Reason -notmatch '仍没有盘符') { $result.Reason += ' 本次新建的文件盘仍没有盘符，请先检查当前布局。' }
     return $result
 }
 
@@ -661,10 +729,13 @@ function Read-PcDisk {
 }
 
 function Read-PcUsedLetters {
-    $letters = @()
-    foreach ($v in @(Get-Volume -ErrorAction Stop)) { if ([string]$v.DriveLetter -match '^[A-Za-z]$') { $letters += ([string]$v.DriveLetter).ToUpperInvariant() } }
-    foreach ($p in @(Get-PSDrive -PSProvider FileSystem -ErrorAction Stop)) { if ($p.Name -match '^[A-Za-z]$') { $letters += $p.Name.ToUpperInvariant() } }
-    return @($letters | Sort-Object -Unique)
+    try {
+        $letters = @()
+        foreach ($v in @(Get-Volume -ErrorAction Stop)) { if ([string]$v.DriveLetter -match '^[A-Za-z]$') { $letters += ([string]$v.DriveLetter).ToUpperInvariant() } }
+        foreach ($p in @(Get-PSDrive -PSProvider FileSystem -ErrorAction Stop)) { if ($p.Name -match '^[A-Za-z]$') { $letters += $p.Name.ToUpperInvariant() } }
+        return @($letters | Sort-Object -Unique)
+    }
+    catch { throw '无法确认当前可用的盘符，已停止；请先检查当前布局。' }
 }
 
 function Read-PcBitLocker {
@@ -700,7 +771,8 @@ function Read-PcPartitionState {
     catch { $spaces = $null }
     foreach ($native in @(Get-Disk -ErrorAction Stop)) {
         $parts = @(); $complete = $true
-        try { $parts = @(Read-PcDiskPartitions $native.Number) } catch { $complete = $false }
+        # 任何硬盘的分区表读不全，都不能把缺失的分区当成空闲或空盘。
+        $parts = @(Read-PcDiskPartitions $native.Number)
         $dynamic = $null; $pooled = $null
         if ($null -ne $legacy) { $dynamic = (@($legacy | Where-Object { $_.DiskIndex -eq $native.Number -and $_.Type -match 'Logical Disk Manager|Dynamic|动态' }).Count -gt 0) }
         if (@($parts | Where-Object { $_.MbrType -eq 66 -or $_.GptType -in @('af9b60a0-1431-4f62-bc68-3311714a69ad', '5808c8aa-7e8f-42e0-85d2-e1e90434cfb3') }).Count -gt 0) { $dynamic = $true }
@@ -751,7 +823,7 @@ function Resize-PcC {
 function New-PcDataPartition {
     param($Volume)
     try {
-        $p = New-Partition -DiskNumber $Volume.DiskNumber -Offset $Volume.Offset -Size $Volume.Size -DriveLetter $Volume.DriveLetter -Confirm:$false -ErrorAction Stop
+        $p = New-Partition -DiskNumber $Volume.DiskNumber -Offset $Volume.Offset -Size $Volume.Size -Confirm:$false -ErrorAction Stop
         return ConvertTo-PcPartitionRecord $p $null
     }
     catch { throw '新建分区失败，已停止，不会重试；请先检查当前布局。' }
@@ -761,13 +833,32 @@ function Format-PcNewVolume {
     param($Partition, [string]$Label)
     try {
         $p = Get-Partition -DiskNumber $Partition.DiskNumber -PartitionNumber $Partition.PartitionNumber -ErrorAction Stop
-        if ($p.Offset -ne $Partition.Offset -or $p.Size -ne $Partition.Size -or [string]$p.DriveLetter -ne $Partition.DriveLetter) { throw '目标发生变化。' }
         $currentVolume = Get-Volume -Partition $p -ErrorAction Stop | Select-Object -First 1
-        if ($p.IsSystem -or $p.IsBoot -or $p.IsHidden -or [string](Get-PcValue $currentVolume 'FileSystem' '') -notin @('', 'RAW')) { throw '目标不再是本次的新空分区。' }
+        $live = ConvertTo-PcPartitionRecord $p $currentVolume
+        if ($live.DiskNumber -ne $Partition.DiskNumber -or $live.PartitionNumber -ne $Partition.PartitionNumber -or
+            $live.Offset -ne $Partition.Offset -or $live.Size -ne $Partition.Size -or $live.DriveLetter -ne '' -or $Partition.DriveLetter -ne '' -or
+            $live.IsSystem -or $live.IsBoot -or $live.IsHidden -or $live.FileSystem -notin @('', 'RAW')) { throw '目标不再是本次的新空分区。' }
         # 按精确分区对象传递，绝不使用可能已经换盘的盘符作为格式化目标。
         $null = Format-Volume -Partition $p -FileSystem NTFS -NewFileSystemLabel $Label -Confirm:$false -ErrorAction Stop
     }
     catch { throw '新分区建立文件盘失败，已停止，不会重试；请先检查当前布局。' }
+}
+
+function Set-PcPartitionLetter {
+    param($Partition, [string]$Letter)
+    try {
+        $p = Get-Partition -DiskNumber $Partition.DiskNumber -PartitionNumber $Partition.PartitionNumber -ErrorAction Stop
+        $volume = Get-Volume -Partition $p -ErrorAction Stop | Select-Object -First 1
+        $live = ConvertTo-PcPartitionRecord $p $volume
+        if ($Letter -notmatch '^[D-Z]$' -or $live.DiskNumber -ne $Partition.DiskNumber -or $live.PartitionNumber -ne $Partition.PartitionNumber -or
+            $live.Offset -ne $Partition.Offset -or $live.Size -ne $Partition.Size -or $live.DriveLetter -ne '' -or $live.FileSystem -ne 'NTFS' -or
+            $live.IsSystem -or $live.IsBoot -or $live.IsHidden) { throw '目标发生变化。' }
+        $taken = $Letter -in @(Read-PcUsedLetters)
+    }
+    catch { throw '分配盘符前无法核实新文件盘或可用盘符，已停止；请先检查当前布局。' }
+    if ($taken) { throw (Get-PcLetterTakenReason $Letter) }
+    try { $null = Set-Partition -DiskNumber $Partition.DiskNumber -PartitionNumber $Partition.PartitionNumber -NewDriveLetter $Letter -Confirm:$false -ErrorAction Stop }
+    catch { throw '分配盘符失败，已停止；请先检查当前布局，不要重复执行。' }
 }
 
 function New-PcVolumeFolder {
@@ -793,6 +884,7 @@ function Write-PcPartitionLog {
 
 function Get-PcOutputPath {
     param([string]$Path, [string]$Kind, $Context)
+    if (-not $Path -and $null -eq $Context) { throw '无法确定结果保存位置，请指定普通本地文件夹中的新文件名。' }
     if (-not $Path) { $Path = Join-Path ([IO.Path]::GetDirectoryName($Context.LogPath)) ($Kind + '-' + [guid]::NewGuid().ToString('N') + '.json') }
     $Path = [IO.Path]::GetFullPath($Path)
     $check = Test-CleanerPathChain -LiteralPath $Path -AllowMissing
@@ -830,17 +922,23 @@ function ConvertTo-PcLiteral {
 
 function New-PcElevationCommand {
     param([string]$ScriptPath, [string]$InputPath, [string]$OutputPath, [string]$Sid)
-    # 先用独立退出码拒绝换账户，避免另一账户无法写原用户目录时丢失拒绝原因。
-    return ('if ([Security.Principal.WindowsIdentity]::GetCurrent().User.Value -cne ' + (ConvertTo-PcLiteral $Sid) + ') { exit 13 }; & ' + (ConvertTo-PcLiteral $ScriptPath) + ' -Apply -ElevatedChild -PlanPath ' + (ConvertTo-PcLiteral $InputPath) +
-        ' -ResultPath ' + (ConvertTo-PcLiteral $OutputPath) + ' -OriginalUserSid ' + (ConvertTo-PcLiteral $Sid) + ' -Confirm:$false -WhatIf:$false')
+    # 13：换账户；12：捕获异常且尚未进入磁盘步骤；21：步骤可能已运行。其他退出码不能证明未修改。
+    return ('$ErrorActionPreference = ''Stop''; $childState = @{ StepMayHaveRun = $false }; try { if ([Security.Principal.WindowsIdentity]::GetCurrent().User.Value -cne ' + (ConvertTo-PcLiteral $Sid) + ') { exit 13 }; & ' + (ConvertTo-PcLiteral $ScriptPath) + ' -Apply -ElevatedChild -PlanPath ' + (ConvertTo-PcLiteral $InputPath) +
+        ' -ResultPath ' + (ConvertTo-PcLiteral $OutputPath) + ' -OriginalUserSid ' + (ConvertTo-PcLiteral $Sid) + ' -ChildState $childState -Confirm:$false -WhatIf:$false; exit 0 } catch { if ($childState.StepMayHaveRun) { exit 21 }; exit 12 }')
+}
+
+function Get-PcElevationArguments {
+    param([string]$Command)
+    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($Command))
+    # 仅设置子进程策略；不修改机器或用户的执行策略。
+    return @('-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $encoded)
 }
 
 function Start-PcElevatedApply {
     param([string]$Command)
     $exe = Join-Path $PSHOME 'pwsh.exe'
     if (-not (Test-Path -LiteralPath $exe)) { $exe = Join-Path $PSHOME 'powershell.exe' }
-    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($Command))
-    $p = Start-Process -FilePath $exe -ArgumentList @('-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', $encoded) -Verb RunAs -Wait -PassThru -ErrorAction Stop
+    $p = Start-Process -FilePath $exe -ArgumentList (Get-PcElevationArguments $Command) -Verb RunAs -Wait -PassThru -ErrorAction Stop
     try { return [int]$p.ExitCode } finally { $p.Dispose() }
 }
 
@@ -850,28 +948,52 @@ function New-PcSkippedResult {
         Status = $Status; StoppedAt = 'Elevation'; Reason = $Reason; Steps = @(); CreatedPartitions = @(); FinalLayout = @() }
 }
 
+function New-PcPreflightResult {
+    param([string]$Sid, [string]$Reason = '无法读取方案文件或当前硬盘状态，执行前检查未完成，已停止；未修改任何分区，请重新检查并规划。')
+    $r = New-PcSkippedResult $Reason $Sid 'Refused'
+    $r.StoppedAt = 'Preflight'
+    return $r
+}
+
+function Get-PcMissingChildResult {
+    param([int]$ExitCode, [string]$Sid)
+    if ($ExitCode -eq 12) { return New-PcPreflightResult $Sid '管理员窗口没有正常运行，尚未开始分区操作；未修改任何分区，请重新检查后再规划。' }
+    $reason = '管理员执行结果缺失，无法确认是否完成；请先检查磁盘状态，不要重复执行。'
+    if ($ExitCode -ne 0) { $reason = '管理员窗口没有正常运行，执行结果缺失，无法确认是否已修改分区；请先检查磁盘状态，不要重复执行。' }
+    return New-PcSkippedResult $reason $Sid 'Failed'
+}
+
 function Invoke-PcPartitionMain {
     param([string]$ScriptPath, [bool]$Planning, [string]$LayoutJson, [string]$InputPath, [string]$OutputPath,
-        [string]$ExpectedSid, [bool]$Child, [bool]$DryRun, [bool]$BlockEncrypted)
+        [string]$ExpectedSid, [bool]$Child, [bool]$DryRun, [bool]$BlockEncrypted, [hashtable]$ChildState)
     if ($DryRun) {
         if ($Planning) { Write-Host '演练：只读规划并新建方案文件；当前不会写入文件。'; return }
-        $p = Read-PcJson $InputPath
-        $r = Invoke-PcPartitionExecution $p $null @{ CurrentUserSid = '' } -WhatIf
+        try {
+            $p = Read-PcJson $InputPath
+            $r = Invoke-PcPartitionExecution $p $null @{ CurrentUserSid = '' } -WhatIf
+        }
+        catch { $r = New-PcPreflightResult '' }
         Write-Output (ConvertTo-Json -InputObject $r -Depth 8)
         # 演练不写结果；RESULT 仅指向已存在的输入方案。
         Write-Output ('RESULT: ' + [IO.Path]::GetFullPath($InputPath)); return
     }
-    $context = Get-CleanerContext
+    $context = $null
+    try { $context = Get-CleanerContext } catch { }
     if ($Planning) {
-        $state = Read-PcPartitionState $context
-        $p = New-PcPartitionPlan $state $LayoutJson -BlockEncrypted:$BlockEncrypted
+        try {
+            if ($null -eq $context) { throw '无法读取当前账户信息。' }
+            $state = Read-PcPartitionState $context
+            $p = New-PcPartitionPlan $state $LayoutJson -BlockEncrypted:$BlockEncrypted
+        }
+        catch { $p = New-PcUnavailablePlan ([string](Get-PcValue $context 'CurrentUserSid' '')) }
         $path = Get-PcOutputPath $InputPath 'partition-plan' $context
         Write-PcJson $p $path
         Write-Host $p.Summary; Write-Output ('RESULT: ' + $path); return
     }
     $path = Get-PcOutputPath $OutputPath 'partition-result' $context
-    if ($ExpectedSid -and $ExpectedSid -cne $context.CurrentUserSid) {
-        $r = New-PcSkippedResult '提权使用了另一个账户，已跳过分区；请使用原账户确认权限。' $context.CurrentUserSid
+    if ($null -eq $context) { $r = New-PcPreflightResult $ExpectedSid '无法读取当前账户信息，执行前检查未完成，已停止；未修改任何分区。' }
+    elseif ($ExpectedSid -and $ExpectedSid -cne $context.CurrentUserSid) {
+        $r = New-PcSkippedResult '提权使用了另一个账户，已跳过分区，未修改任何分区；请使用原账户确认权限。' $context.CurrentUserSid
     }
     elseif (-not $context.IsAdmin -and -not $Child) {
         $command = New-PcElevationCommand $ScriptPath ([IO.Path]::GetFullPath($InputPath)) $path $context.CurrentUserSid
@@ -881,7 +1003,7 @@ function Invoke-PcPartitionMain {
             Write-PcJson $r $path; Write-Output ('RESULT: ' + $path); return
         }
         if ($exitCode -eq 13) {
-            $r = New-PcSkippedResult '提权使用了另一个账户，已跳过分区；请使用原账户确认权限。' $context.CurrentUserSid
+            $r = New-PcSkippedResult '提权使用了另一个账户，已跳过分区，未修改任何分区；请使用原账户确认权限。' $context.CurrentUserSid
             Write-PcJson $r $path; Write-Output ('RESULT: ' + $path); return
         }
         if (Test-Path -LiteralPath $path -PathType Leaf) {
@@ -889,16 +1011,20 @@ function Invoke-PcPartitionMain {
             if ($childResult.Schema -cne 'pc-care/partition/1') { throw '管理员结果无法核实，请检查磁盘状态，不要重复执行。' }
             Write-Host $childResult.Reason; Write-Output ('RESULT: ' + $path); return
         }
-        $r = New-PcSkippedResult '管理员执行结果缺失，无法确认是否完成；请先检查磁盘状态，不要重复执行。' $context.CurrentUserSid 'Failed'
+        $r = Get-PcMissingChildResult $exitCode $context.CurrentUserSid
     }
     elseif (-not $context.IsAdmin) { $r = New-PcSkippedResult '没有获得管理员权限，已跳过分区。' $context.CurrentUserSid }
     else {
-        $p = Read-PcJson $InputPath
+        if ($null -eq $ChildState) { $ChildState = @{ StepMayHaveRun = $false } }
         try {
+            $p = Read-PcJson $InputPath
             $state = Read-PcPartitionState $context
-            $r = Invoke-PcPartitionExecution $p $state $context -BlockEncrypted:$BlockEncrypted -Confirm:$false
+            $r = Invoke-PcPartitionExecution $p $state $context -BlockEncrypted:$BlockEncrypted -ChildState $ChildState -Confirm:$false
         }
-        catch { $r = New-PcSkippedResult '无法完成执行前检查，已停止；请先检查磁盘状态，不要重复执行。' $context.CurrentUserSid 'Refused'; $r.StoppedAt = 'Preflight' }
+        catch {
+            if ($ChildState.StepMayHaveRun) { $r = New-PcSkippedResult '分区操作后无法完整核实结果，已停止；请先检查磁盘状态，不要重复执行。' $context.CurrentUserSid 'Failed' }
+            else { $r = New-PcPreflightResult $context.CurrentUserSid }
+        }
     }
     Write-PcJson $r $path
     Write-Host $r.Reason; Write-Output ('RESULT: ' + $path)
@@ -907,4 +1033,4 @@ function Invoke-PcPartitionMain {
 if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) { throw '分区规划仅支持 Windows 10 和 Windows 11。' }
 . (Join-Path $PSScriptRoot 'common.ps1')
 Invoke-PcPartitionMain -ScriptPath $PSCommandPath -Planning ([bool]$Plan) -LayoutJson $Layout -InputPath $PlanPath -OutputPath $ResultPath `
-    -ExpectedSid $OriginalUserSid -Child ([bool]$ElevatedChild) -DryRun ([bool]$WhatIfPreference) -BlockEncrypted $script:BlockBitLockerProtectedOrUnknownShrink
+    -ExpectedSid $OriginalUserSid -Child ([bool]$ElevatedChild) -DryRun ([bool]$WhatIfPreference) -BlockEncrypted $script:BlockBitLockerProtectedOrUnknownShrink -ChildState $ChildState

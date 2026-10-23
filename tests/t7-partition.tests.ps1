@@ -262,7 +262,7 @@ $actual.Size = $small.CAfterBytes + 1MB
 Assert-True (-not (Resolve-PcAfterShrink $c $actual $small.CAfterBytes $small.NewVolumes 120GB).Valid) 'P4 最后卷减至不足 20 GB 停止'
 $actual.Size = $p.CAfterBytes - 1MB
 Assert-True (-not (Resolve-PcAfterShrink $c $actual $p.CAfterBytes $p.NewVolumes $p.CAfterBytes).Valid) 'P4 实际 C 不能小于实时保留量'
-$v = $p.NewVolumes[0]; $createdPart = New-TestPartition 2 ($v.Offset + 1MB) ($v.Size - 16MB) $v.DriveLetter
+$v = $p.NewVolumes[0]; $createdPart = New-TestPartition 2 ($v.Offset + 1MB) ($v.Size - 16MB) ''
 Assert-True (Test-PcCreatedSize $v $createdPart) 'P4 新分区对齐容差边界'
 $createdPart.Offset += 1
 Assert-True (-not (Test-PcCreatedSize $v $createdPart)) 'P4 超过 1 MB 偏移拒绝'
@@ -272,7 +272,7 @@ $createdPart.Size = $v.Size + 1
 Assert-True (-not (Test-PcCreatedSize $v $createdPart)) 'P4 不允许新分区变大'
 
 # 格式化守卫必须用本次创建记录、实际分区和调整后的旧 C；不能格式化旧盘或重试。
-$target = New-TestPartition 2 $v.Offset ($v.Size - 8MB) 'D' 0 'Basic' ''
+$target = New-TestPartition 2 $v.Offset ($v.Size - 8MB) '' 0 'Basic' ''
 $shrunk = Copy-TestObject $c; $shrunk.Size = $p.CAfterBytes
 $records = @([pscustomobject]@{ RunId = 'this-run'; Partition = (Copy-TestObject $target) })
 $current = @($shrunk, $target)
@@ -288,7 +288,25 @@ Assert-True (-not (Test-PcFormatTarget $wrong $records @($shrunk) @($shrunk, $wr
 $changedLive = Copy-TestObject $target; $changedLive.Offset += 1MB
 Assert-True (-not (Test-PcFormatTarget $target $records @($shrunk) @($shrunk, $changedLive) 'this-run')) '读取后实时目标又变更时拒绝格式化'
 $steps = @(Get-PcPartitionSteps $p)
-Assert-Equal (($steps.Id) -join ',') 'ShrinkC,NewPartition,FormatVolume,CreateFolders,NewPartition,FormatVolume,CreateFolders' '执行步骤顺序'
+Assert-Equal (($steps.Id) -join ',') 'ShrinkC,NewPartition,FormatVolume,AssignLetter,CreateFolders,NewPartition,FormatVolume,AssignLetter,CreateFolders' 'R2 执行步骤顺序：无盘符新建、格式化、分配盘符、目录'
+
+# R2：有盘符的原始分区也不能进入格式化，精确身份必须仍来自本次无盘符创建记录。
+$lettered = Copy-TestObject $target; $lettered.DriveLetter = 'D'
+Assert-True (-not (Test-PcCreatedSize $v $lettered)) 'R2 新建回读必须无盘符'
+$letteredRecords = @(@{ RunId = 'this-run'; Partition = $lettered })
+Assert-True (-not (Test-PcFormatTarget $lettered $letteredRecords @($shrunk) @($shrunk, $lettered) 'this-run')) 'R2 即使记录匹配也拒绝带盘符的原始分区'
+foreach ($field in @('DiskNumber', 'PartitionNumber', 'Offset', 'Size')) {
+    $wrong = Copy-TestObject $target; $wrong.$field += 1
+    Assert-True (-not (Test-PcFormatTarget $wrong $records @($shrunk) @($shrunk, $wrong) 'this-run')) ('R2 创建身份不匹配拒绝 ' + $field)
+}
+Assert-True (-not (Test-PcFormatTarget $target $records @($shrunk, $target) $current 'this-run')) 'R2 旧分区即使伪装成本次记录也拒绝'
+$overlap = Copy-TestObject $target; $overlap.PartitionNumber = 9
+Assert-True (-not (Test-PcFormatTarget $target $records @($shrunk) @($shrunk, $target, $overlap) 'this-run')) 'R2 实时其他分区重叠拒绝'
+$formatted = Copy-TestObject $target; $formatted.FileSystem = 'NTFS'
+Assert-True (Test-PcAssignLetter $formatted $records @($shrunk) @($shrunk, $formatted) 'this-run' 'D' @('C')).Valid 'R2 本次无盘符 NTFS 可分配盘符'
+Assert-True (-not (Test-PcAssignLetter $target $records @($shrunk) $current 'this-run' 'D' @('C')).Valid) 'R2 未格式化不可分配盘符'
+Assert-True (-not (Test-PcAssignLetter $formatted $records @($shrunk) @($shrunk, $formatted) 'other-run' 'D' @('C')).Valid) 'R2 分配盘符仍核对本次创建证据'
+Assert-True (-not (Test-PcAssignLetter $formatted $records @($shrunk) @($shrunk, $formatted) 'this-run' 'D' @('C', 'D')).Valid) 'R2 分配时盘符占用拒绝'
 
 # 适配器假实现：覆盖整个执行器，不运行任何 Windows / 外部进程 / 日志写入。
 $script:sideEffects = @(); $script:fakeParts = @(); $script:shrinkDelta = 0; $script:newDelta = 0; $script:failAt = ''; $script:newOffsetDelta = 0
@@ -310,15 +328,25 @@ function New-PcDataPartition {
     param($Volume)
     $script:sideEffects += 'New'
     if ($script:failAt -eq 'NewPartition') { throw '模拟创建失败' }
-    $new = New-TestPartition ($script:fakeParts.Count + 1) ($Volume.Offset + $script:newOffsetDelta) ($Volume.Size + $script:newDelta) $Volume.DriveLetter $Volume.DiskNumber 'Basic' ''
+    $new = New-TestPartition ($script:fakeParts.Count + 1) ($Volume.Offset + $script:newOffsetDelta) ($Volume.Size + $script:newDelta) '' $Volume.DiskNumber 'Basic' ''
     $script:fakeParts += $new
     return Copy-TestObject $new
 }
 function Format-PcNewVolume {
     param($Partition, $Label)
     $script:sideEffects += 'Format'
+    Assert-Equal $Partition.DriveLetter '' 'R2 格式化入口没有盘符'
     if ($script:failAt -eq 'FormatVolume') { throw '模拟格式化失败' }
     $found = Read-PcPartition $Partition.DiskNumber $Partition.PartitionNumber; $found.FileSystem = 'NTFS'; $found.Label = $Label
+}
+function Set-PcPartitionLetter {
+    param($Partition, $Letter)
+    $script:sideEffects += 'Assign'
+    if ($script:failAt -eq 'AssignLetter') { throw '模拟分配盘符失败' }
+    $found = Read-PcPartition $Partition.DiskNumber $Partition.PartitionNumber
+    Assert-Equal $found.FileSystem 'NTFS' 'R2 分配入口已经格式化'
+    Assert-Equal $found.DriveLetter '' 'R2 分配前保持无盘符'
+    $found.DriveLetter = $Letter
 }
 function New-PcVolumeFolder { param($Letter, $Name); $script:sideEffects += 'Folder'; if ($script:failAt -eq 'CreateFolders') { throw '模拟建目录失败' } }
 function Reset-TestExecution {
@@ -331,7 +359,7 @@ $s = New-TestState; $p = New-PcPartitionPlan $s; Reset-TestExecution $s
 $r = Invoke-PcPartitionExecution $p $s $context -WhatIf
 Assert-Equal $r.Status 'WhatIf' 'WhatIf 状态'
 Assert-Equal $script:sideEffects.Count 0 'WhatIf 无任何副作用调用'
-Assert-Equal $r.Steps.Count 7 'WhatIf 打印完整步骤'
+Assert-Equal $r.Steps.Count 9 'WhatIf 打印完整步骤'
 Assert-Equal $script:fakeParts[0].Size 500GB 'WhatIf C 未变'
 Reset-TestExecution $s; $script:shrinkDelta = 32MB; $script:newDelta = -8MB; $script:newOffsetDelta = 1MB
 $r = Invoke-PcPartitionExecution $p $s $context -Confirm:$false
@@ -341,13 +369,13 @@ Assert-Equal $r.CreatedPartitions[0].Partition.Size ($p.NewVolumes[0].Size - 8MB
 Assert-Equal $r.CreatedPartitions[0].Partition.Offset ($p.NewVolumes[0].Offset + 33MB) 'P4 记录新卷实际对齐偏移'
 Assert-Equal $r.FinalLayout[2].Size ($p.NewVolumes[1].Size - 32MB - 8MB) 'P4 最后卷实际值'
 Assert-Equal @($script:sideEffects | Where-Object { $_ -eq 'Format' }).Count 2 '只格式化两个本次新卷'
-foreach ($failure in @('ShrinkC', 'NewPartition', 'FormatVolume', 'CreateFolders')) {
+foreach ($failure in @('ShrinkC', 'NewPartition', 'FormatVolume', 'AssignLetter', 'CreateFolders')) {
     Reset-TestExecution $s; $script:failAt = $failure
     $r = Invoke-PcPartitionExecution $p $s $context -Confirm:$false
     Assert-Equal $r.Status 'Failed' ('首次失败即停 ' + $failure)
     Assert-Equal $r.StoppedAt ($failure + ':' + $(if ($failure -eq 'ShrinkC') { -1 } else { 0 })) '准确记录停止步骤'
     Assert-Equal $r.Steps[-1].Status 'Failed' '步骤记录失败'
-    $operation = @{ ShrinkC = 'Resize'; NewPartition = 'New'; FormatVolume = 'Format'; CreateFolders = 'Folder' }[$failure]
+    $operation = @{ ShrinkC = 'Resize'; NewPartition = 'New'; FormatVolume = 'Format'; AssignLetter = 'Assign'; CreateFolders = 'Folder' }[$failure]
     Assert-Equal @($script:sideEffects | Where-Object { $_ -eq $operation }).Count 1 '失败操作绝不重试'
     Assert-Equal @($script:sideEffects | Where-Object { $_ -eq 'New' }).Count $(if ($failure -eq 'ShrinkC') { 0 } else { 1 }) '失败不创建后续卷'
 }
@@ -426,16 +454,19 @@ Assert-True (($output -join '') -match 'RESULT: .*fake-plan.json') '演练只引
         $definition = @($ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }, $true))[0]
         . ([scriptblock]::Create($definition.Extent.Text))
     }
-    $script:nativeAllowed = $false; $script:nativeDynamic = $false
+    $script:nativeAllowed = $false; $script:nativeDynamic = $false; $script:nativeDeny = ''
     $script:nativeState = New-TestState
     $script:nativeState.Disks[0] | Add-Member -NotePropertyName NumberOfPartitions -NotePropertyValue 1
     function Get-Disk {
         [CmdletBinding()]param($Number)
-        return $script:nativeState.Disks[0]
+        if ($script:nativeDeny -eq 'Disk') { throw 'Access is denied' }
+        if ($PSBoundParameters.ContainsKey('Number')) { return @($script:nativeState.Disks | Where-Object { $_.Number -eq $Number }) }
+        return $script:nativeState.Disks
     }
     function Get-Partition {
         [CmdletBinding()]param($DiskNumber, $PartitionNumber)
-        return $script:nativeState.Disks[0].Partitions[0]
+        if ($script:nativeDeny -eq 'Partitions' -or ($script:nativeDeny -eq 'SecondPartitions' -and $DiskNumber -eq 1)) { throw 'Access is denied' }
+        return @($script:nativeState.Disks | Where-Object { $_.Number -eq $DiskNumber })[0].Partitions
     }
     function Get-Volume {
         [CmdletBinding()]param($Partition)
@@ -443,6 +474,7 @@ Assert-True (($output -join '') -match 'RESULT: .*fake-plan.json') '演练只引
     }
     function Get-PSDrive {
         [CmdletBinding()]param($PSProvider)
+        if ($script:nativeDeny -eq 'Letters') { throw 'Access is denied' }
         return @([pscustomobject]@{ Name = 'C' }, [pscustomobject]@{ Name = 'Q' })
     }
     function Get-CimInstance {
@@ -478,6 +510,29 @@ Assert-True (($output -join '') -match 'RESULT: .*fake-plan.json') '演练只引
     $script:nativeState.Disks[0].NumberOfPartitions = 2; $failed = $false
     try { $null = @(Read-PcDiskPartitions 0) } catch { $failed = $true }
     Assert-True $failed '分区清单数不完整立即拒绝'
+    # R3a/b：使用实际读取适配器，拒绝 Get-Disk、Get-Partition 和盘符读取。
+    $script:nativeState.Disks[0].NumberOfPartitions = 1; $script:nativeDynamic = $false
+    $second = New-TestDisk 1 @((New-TestPartition 1 1MB 30GB '' 1 'OEM' '')) 200GB 'SATA'
+    $second | Add-Member -NotePropertyName NumberOfPartitions -NotePropertyValue 1
+    $script:nativeState.Disks += $second
+    $readContext = @{ SystemDrive = 'C:'; CurrentUserSid = 'test-sid'; IsAdmin = $true }
+    $planForReadFailure = New-PcPartitionPlan (New-TestState)
+    function Get-CleanerContext { return $readContext }
+    function Read-PcJson { param($Path); return $planForReadFailure }
+    function Get-PcOutputPath { param($Path, $Kind, $Context); return 'memory-read-result.json' }
+    function Write-PcJson { param($Value, $Path); $script:readFailureWrites += $Value }
+    foreach ($denied in @('Disk', 'Partitions', 'Letters', 'SecondPartitions')) {
+        $script:nativeDeny = $denied; $script:readFailureWrites = @()
+        $output = @(Invoke-PcPartitionMain -ScriptPath 'fake.ps1' -Planning $true -InputPath 'plan.json' -BlockEncrypted $true)
+        $unavailable = $script:readFailureWrites[0]
+        Assert-Equal $unavailable.Situation 'Unknown' ('R3a 实际读取失败 -> Unknown ' + $denied)
+        Assert-True (-not $unavailable.Feasible -and $unavailable.NeedsElevatedRead) ('R3a 实际权限失败标记 ' + $denied)
+        Assert-True (($output -join '') -match 'RESULT: memory-read-result.json') ('R3a 实际读取失败仍输出 RESULT ' + $denied)
+        $script:readFailureWrites = @()
+        $output = @(Invoke-PcPartitionMain -ScriptPath 'fake.ps1' -Planning $false -InputPath 'plan.json' -Child $true -BlockEncrypted $true)
+        Assert-Equal $script:readFailureWrites[0].Status 'Refused' ('R3b 实际读取失败仍写子结果 ' + $denied)
+        Assert-Equal $script:readFailureWrites[0].StoppedAt 'Preflight' ('R3b 实际读取失败无磁盘步骤 ' + $denied)
+    }
 }
 
 # UAC 和主入口：完全用内存结果替代磁盘文件，确认每次 Apply 最多请求一次权限。
@@ -507,4 +562,219 @@ Assert-True (($output -join '') -match 'RESULT: .*fake-plan.json') '演练只引
     Assert-Equal $script:mainWrites[0].Status 'Skipped' '更换账户报跳过'
     Assert-True ($script:mainWrites[0].Reason -match '另一个账户') '即使子进程不能写原目录仍报告账户变化'
 }
-Write-Host ("PASS t7-partition: {0} assertions; P1/P2/P3/P4; AST-only loading; fake storage; no script body executed." -f $script:assertions)
+# R1：纯主机参数、实际启动入口及退出码协议；从不更改用户/机器策略。
+& {
+    $command = New-PcElevationCommand 'Invoke-TestChild' '方案 空格.json' '结果.json' 'test-sid'
+    $arguments = @(Get-PcElevationArguments $command)
+    Assert-Equal ($arguments[0..5] -join ' ') '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand' 'R1 完整主机参数包含进程级 Bypass'
+    Assert-Equal $arguments.Count 7 'R1 编码命令独立参数'
+    Assert-Equal ([Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($arguments[6]))) $command 'R1 UTF-16 编码无损往返'
+    Assert-Equal @($ast.FindAll({ param($n) $n -is [Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Set-ExecutionPolicy' }, $true)).Count 0 'R1 从不写入执行策略'
+    $definition = @($ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Start-PcElevatedApply' }, $true))[0]
+    . ([scriptblock]::Create($definition.Extent.Text))
+    function Test-Path { param($LiteralPath); return $true }
+    function Start-Process {
+        [CmdletBinding()]param($FilePath, $ArgumentList, $Verb, [switch]$Wait, [switch]$PassThru)
+        Assert-Equal ($ArgumentList -join '|') ($arguments -join '|') 'R1 启动器实际使用纯函数参数'
+        Assert-Equal $Verb 'RunAs' 'R1 保留 UAC'
+        Assert-True ($Wait -and $PassThru) 'R1 等待退出码'
+        $process = [pscustomobject]@{ ExitCode = 12 }
+        $process | Add-Member -MemberType ScriptMethod -Name Dispose -Value { }
+        return $process
+    }
+    Assert-Equal (Start-PcElevatedApply $command) 12 'R1 返回子进程退出码'
+    # 用假身份/假入口运行生成的包装器；exit 改为 return，避免结束测试宿主。
+    $testCommand = $command.Replace('[Security.Principal.WindowsIdentity]::GetCurrent().User.Value', "'test-sid'") -replace '\bexit (0|12|13|21)\b', 'return $1'
+    $mode = 'Before'
+    function Invoke-TestChild {
+        [CmdletBinding(SupportsShouldProcess = $true)]
+        param([switch]$Apply, [switch]$ElevatedChild, $PlanPath, $ResultPath, $OriginalUserSid, $ChildState)
+        if ($mode -eq 'Before') { throw 'Access denied before script execution' }
+        if ($mode -eq 'After') { $ChildState.StepMayHaveRun = $true; throw 'Result write failed after step' }
+    }
+    Assert-Equal (& ([scriptblock]::Create($testCommand))) 12 'R1 启动异常且无步骤 -> 12'
+    $mode = 'After'
+    Assert-Equal (& ([scriptblock]::Create($testCommand))) 21 'R1 步骤后结果丢失 -> 21'
+    $mode = 'Success'
+    Assert-Equal (& ([scriptblock]::Create($testCommand))) 0 'R1 正常入口 -> 0'
+    Assert-Equal (& ([scriptblock]::Create($testCommand.Replace("'test-sid' -cne", "'other-sid' -cne")))) 13 'R1 换账户在脚本前退出 -> 13'
+}
+
+# R2：格式化后才占用盘符时，保留无盘符 NTFS，停止且不建目录/后续分区。
+& {
+    $s = New-TestState; $p = New-PcPartitionPlan $s; Reset-TestExecution $s
+    function Read-PcUsedLetters {
+        if (@($script:fakeParts | Where-Object { $_.DriveLetter -eq '' -and $_.FileSystem -eq 'NTFS' }).Count -gt 0) { return @('C', 'D') }
+        return @('C')
+    }
+    $phase = @{ StepMayHaveRun = $false }
+    $r = Invoke-PcPartitionExecution $p $s $context -ChildState $phase -Confirm:$false
+    Assert-Equal $r.Status 'Failed' 'R2 分配时占用正常返回失败结果'
+    Assert-Equal $r.StoppedAt 'AssignLetter:0' 'R2 停在分配盘符'
+    Assert-True ($r.Reason -match '盘符已被占用.*仍没有盘符') 'R2 中文说明保留无盘符文件盘'
+    Assert-Equal $r.UnassignedFormattedPartitions.Count 1 'R2 结果列出无盘符 NTFS'
+    Assert-Equal $r.FinalLayout[1].DriveLetter '' 'R2 最终布局没有提前暴露盘符'
+    Assert-Equal $r.FinalLayout[1].FileSystem 'NTFS' 'R2 保留已格式化状态'
+    Assert-Equal @($script:sideEffects | Where-Object { $_ -eq 'Format' }).Count 1 'R2 不重复格式化'
+    Assert-Equal @($script:sideEffects | Where-Object { $_ -in @('Assign', 'Folder') }).Count 0 'R2 占用后不分配也不建目录'
+    Assert-Equal $r.CreatedPartitions.Count 1 'R2 不创建后续分区'
+    Assert-True $phase.StepMayHaveRun 'R1 开始磁盘步骤后标记可能已修改'
+    $phase.StepMayHaveRun = $false; $s.BitLocker = 'Unknown'
+    $r = Invoke-PcPartitionExecution $p $s $context -ChildState $phase -Confirm:$false
+    Assert-True (-not $phase.StepMayHaveRun) 'R1 前置拒绝不标记已进入步骤'
+}
+& {
+    foreach ($field in @('DriveLetter', 'FileSystem', 'Offset', 'Size')) {
+        $s = New-TestState; $p = New-PcPartitionPlan $s; Reset-TestExecution $s
+        function Set-PcPartitionLetter {
+            param($Partition, $Letter)
+            $found = Read-PcPartition $Partition.DiskNumber $Partition.PartitionNumber
+            $found.DriveLetter = $Letter
+            switch ($field) {
+                'DriveLetter' { $found.DriveLetter = 'X' }
+                'FileSystem' { $found.FileSystem = 'RAW' }
+                'Offset' { $found.Offset += 1MB }
+                'Size' { $found.Size -= 1MB }
+            }
+        }
+        $r = Invoke-PcPartitionExecution $p $s $context -Confirm:$false
+        Assert-Equal $r.StoppedAt 'AssignLetter:0' ('R2 分配后精确校验 ' + $field)
+        Assert-Equal @($script:sideEffects | Where-Object { $_ -eq 'Folder' }).Count 0 ('R2 校验失败不建目录 ' + $field)
+    }
+}
+
+# R2：真实写入适配器仅绑定内存假命令，检查 Windows 参数及分配前最后一次盘符竞争。
+& {
+    foreach ($name in @('New-PcDataPartition', 'Format-PcNewVolume', 'Set-PcPartitionLetter')) {
+        $definition = @($ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }, $true))[0]
+        . ([scriptblock]::Create($definition.Extent.Text))
+    }
+    $s = New-TestState; $p = New-PcPartitionPlan $s; $v = $p.NewVolumes[0]
+    $native = New-TestPartition 2 $v.Offset $v.Size '' 0 'Basic' 'RAW'
+    $native.DriveLetter = [string][char]0
+    $volume = @{ FileSystem = 'RAW' }; $taken = $false
+    function New-Partition {
+        [CmdletBinding(SupportsShouldProcess = $true)]param($DiskNumber, $Offset, $Size, $DriveLetter, [switch]$AssignDriveLetter)
+        Assert-True (-not $PSBoundParameters.ContainsKey('DriveLetter') -and -not $PSBoundParameters.ContainsKey('AssignDriveLetter')) 'R2 New-Partition 不传任何盘符参数'
+        return $native
+    }
+    function Get-Partition { [CmdletBinding()]param($DiskNumber, $PartitionNumber); return $native }
+    function Get-Volume { [CmdletBinding()]param($Partition); return $volume }
+    function Format-Volume {
+        [CmdletBinding(SupportsShouldProcess = $true)]param($Partition, $FileSystem, $NewFileSystemLabel)
+        Assert-True ([object]::ReferenceEquals($Partition, $native)) 'R2 Format-Volume 使用精确分区对象'
+        Assert-Equal $FileSystem 'NTFS' 'R2 格式化为 NTFS'
+        $volume.FileSystem = 'NTFS'; $script:adapterFormatCalls++
+    }
+    function Read-PcUsedLetters { if ($taken) { return @('C', 'D') }; return @('C') }
+    function Set-Partition {
+        [CmdletBinding(SupportsShouldProcess = $true)]param($DiskNumber, $PartitionNumber, $NewDriveLetter)
+        Assert-Equal $DiskNumber $native.DiskNumber 'R2 精确硬盘分配盘符'
+        Assert-Equal $PartitionNumber $native.PartitionNumber 'R2 精确分区分配盘符'
+        Assert-Equal $NewDriveLetter 'D' 'R2 只分配规划盘符'
+        $script:adapterAssignCalls++; $native.DriveLetter = $NewDriveLetter
+    }
+    $script:adapterFormatCalls = 0; $script:adapterAssignCalls = 0
+    $created = New-PcDataPartition $v
+    Assert-Equal $created.DriveLetter '' 'R2 Windows 空字符盘符规范化'
+    Format-PcNewVolume $created '资料'
+    Assert-Equal $script:adapterFormatCalls 1 'R2 无盘符格式化成功'
+    $formatted = ConvertTo-PcPartitionRecord $native $volume
+    $taken = $true; $reason = ''
+    try { Set-PcPartitionLetter $formatted 'D' } catch { $reason = $_.Exception.Message }
+    Assert-True ($reason -match '盘符已被占用.*仍没有盘符') 'R2 最后一次竞争也返回中文无盘符原因'
+    Assert-Equal $script:adapterAssignCalls 0 'R2 最后一次检查发现占用不调用 Set-Partition'
+    $taken = $false; Set-PcPartitionLetter $formatted 'D'
+    Assert-Equal $script:adapterAssignCalls 1 'R2 确认空闲后才分配'
+    $reason = ''; try { Format-PcNewVolume $created '资料' } catch { $reason = $_.Exception.Message }
+    Assert-True ([bool]$reason) 'R2 适配器也拒绝重复格式化'
+    Assert-Equal $script:adapterFormatCalls 1 'R2 重复格式化没有调用 Windows 命令'
+}
+
+# R3a / P2：决定“布局致命、辅助安全检查待确认”的纯逻辑。
+foreach ($read in @('Layout', 'UsedLetters', 'UnrecognizedRead')) {
+    Assert-True (Get-PcReadFailure $read).Fatal ('R3a 规划依据缺失即停止 ' + $read)
+}
+foreach ($read in @('DiskKind', 'BitLocker', 'MaxShrink')) {
+    Assert-True (-not (Get-PcReadFailure $read).Fatal) ('R3a 辅助读取待确认 ' + $read)
+    Assert-True (Get-PcReadFailure $read $true).Fatal ('R3a 提权后仍未知致命 ' + $read)
+}
+
+# R1/R3：所有文件读写都是内存假实现，覆盖主入口和提权子入口的失败结果输出。
+& {
+    $mode = ''; $admin = $true; $exitCode = 0; $state = New-TestState; $planObject = New-PcPartitionPlan $state
+    function Get-CleanerContext {
+        if ($mode -eq 'Context') { throw 'Access is denied' }
+        return @{ IsAdmin = $admin; CurrentUserSid = 'test-sid'; LogPath = 'memory-log' }
+    }
+    function Get-PcOutputPath { param($Path, $Kind, $Context); return 'memory-result.json' }
+    function Write-PcJson { param($Value, $Path); $script:failureWrites += (Copy-TestObject $Value) }
+    function Read-PcJson {
+        param($Path)
+        $script:failureReads++
+        switch ($mode) {
+            'Missing' { throw 'File not found' }
+            'Unreadable' { throw 'Access is denied' }
+            'Malformed' { throw 'Invalid JSON' }
+            'Incomplete' { return @{ Schema = 'pc-care/partition-plan/1' } }
+        }
+        return $planObject
+    }
+    function Read-PcPartitionState { param($Context); if ($mode -eq 'Live') { throw 'Access is denied' }; return $state }
+    function Invoke-PcPartitionExecution {
+        [CmdletBinding(SupportsShouldProcess = $true)]param($PlanObject, $State, $Context, $BlockEncrypted, $ChildState)
+        $script:failureExecCalls++
+        if ($mode -eq 'Incomplete') { throw 'Missing property' }
+        if ($mode -eq 'AfterStep') { $ChildState.StepMayHaveRun = $true; throw 'Unexpected error after step' }
+        return @{ Schema = 'pc-care/partition/1'; Status = 'Done'; Reason = '' }
+    }
+    function Start-PcElevatedApply { param($Command); return $exitCode }
+    function Test-Path { param($LiteralPath, $PathType); return $false }
+    foreach ($child in @($false, $true)) {
+        foreach ($failure in @('Missing', 'Unreadable', 'Malformed', 'Incomplete', 'Live', 'Context')) {
+            $mode = $failure; $script:failureWrites = @(); $script:failureExecCalls = 0; $script:failureReads = 0
+            $output = @(Invoke-PcPartitionMain -ScriptPath 'fake.ps1' -Planning $false -InputPath 'plan.json' -OutputPath 'child-result.json' -Child $child -BlockEncrypted $true)
+            Assert-Equal $script:failureWrites.Count 1 ('R3b 每次失败保存唯一结果 ' + $child + '/' + $failure)
+            $r = $script:failureWrites[0]
+            Assert-Equal $r.Schema 'pc-care/partition/1' 'R3b 结果契约'
+            Assert-Equal $r.Status 'Refused' 'R3b 读取失败拒绝'
+            Assert-Equal $r.StoppedAt 'Preflight' 'R3b 停于前置检查'
+            Assert-True ($r.Reason -match '未修改任何分区' -and $r.Reason -notmatch 'Access|JSON|property|重复执行') 'R3b 中文说明无磁盘修改'
+            Assert-True (($output -join '') -match 'RESULT: memory-result.json') 'R3b 总是输出 RESULT'
+            if ($failure -ne 'Incomplete') { Assert-Equal $script:failureExecCalls 0 'R3b 读取失败不进入执行器' }
+        }
+    }
+    $mode = 'Live'; $script:failureWrites = @()
+    $output = @(Invoke-PcPartitionMain -ScriptPath 'fake.ps1' -Planning $true -InputPath 'plan.json' -BlockEncrypted $true)
+    $r = $script:failureWrites[0]
+    Assert-Equal $r.Schema 'pc-care/partition-plan/1' 'R3a 布局读取失败仍保存方案'
+    Assert-Equal $r.Situation 'Unknown' 'R3a 不把未知布局误报为空闲'
+    Assert-Equal $r.Feasible $false 'R3a 布局读取失败不可行'
+    Assert-True $r.NeedsElevatedRead 'R3a 标明需要提权读取'
+    Assert-True ($r.Blockers[0] -match '管理员权限' -and $r.Blockers[0] -notmatch 'Access') 'R3a 明确中文阻碍'
+    Assert-Equal @($r.NewVolumes).Count 0 'R3a 不虚构新分区'
+    Assert-True (($output -join '') -match 'RESULT: memory-result.json') 'R3a 失败方案照常输出 RESULT'
+    $mode = 'AfterStep'; $script:failureWrites = @()
+    $null = @(Invoke-PcPartitionMain -ScriptPath 'fake.ps1' -Planning $false -InputPath 'plan.json' -BlockEncrypted $true)
+    Assert-Equal $script:failureWrites[0].Status 'Failed' 'R1 步骤后意外异常不能误报前置拒绝'
+    Assert-True ($script:failureWrites[0].Reason -notmatch '未修改任何分区' -and $script:failureWrites[0].Reason -match '不要重复执行') 'R1 步骤后异常保留布局检查提示'
+    $admin = $false; $mode = ''
+    foreach ($code in @(0, 1, 12, 13, 21)) {
+        $exitCode = $code; $script:failureWrites = @()
+        $output = @(Invoke-PcPartitionMain -ScriptPath 'fake.ps1' -Planning $false -InputPath 'plan.json' -BlockEncrypted $true)
+        $r = $script:failureWrites[0]
+        Assert-True (($output -join '') -match 'RESULT: memory-result.json') ('R1 缺失结果仍输出 RESULT ' + $code)
+        if ($code -notin @(0, 13)) { Assert-True ($r.Reason -match '管理员窗口没有正常运行') ('R1 非零退出中文解释 ' + $code) }
+        if ($code -eq 13) {
+            Assert-Equal $r.Status 'Skipped' 'R1 换账户保持跳过'
+            Assert-True ($r.Reason -match '未修改任何分区' -and $r.Reason -notmatch '不要重复执行') 'R1 换账户退出也明确没有修改'
+        }
+        elseif ($code -eq 12) {
+            Assert-Equal $r.Status 'Refused' 'R1 已证明无步骤时拒绝'
+            Assert-Equal $r.StoppedAt 'Preflight' 'R1 无步骤停在前置检查'
+            Assert-True ($r.Reason -match '未修改任何分区' -and $r.Reason -notmatch '不要重复执行') 'R1 已证明无修改不误报警告'
+        }
+        else { Assert-True ($r.Reason -match '先检查磁盘状态.*不要重复执行' -and $r.Reason -notmatch '未修改任何分区') 'R1 可能修改时保留检查布局提示' }
+    }
+}
+Write-Host ("PASS t7-partition: {0} assertions; P1/P2/P3/P4; R1/R2/R3a/R3b; AST-only loading; fake storage; no script body executed." -f $script:assertions)
