@@ -119,6 +119,7 @@ param(
     [switch]$VerifyHash
 )
 
+Set-StrictMode -Version 2.0
 if ($env:OS -ne 'Windows_NT') { throw '此脚本只能在 Windows 上运行。' }
 . (Join-Path $PSScriptRoot "common.ps1")
 
@@ -226,7 +227,7 @@ function Assert-MigrationSeparation {
         $new.StartsWith($old + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
         throw '源与目标必须分离，不能相同或互为父子目录。'
     }
-    if ([System.IO.Path]::GetPathRoot($old) -ieq [System.IO.Path]::GetPathRoot($new)) {
+    if ($old.Substring(0, 2) -ieq $new.Substring(0, 2)) {
         throw '迁移目标必须位于另一个本地数据卷。'
     }
 }
@@ -844,14 +845,16 @@ function Write-MigrationManifest {
 }
 
 function Open-MigrationManifestLock {
-    param([string]$Path)
+    param([string]$Path, [switch]$Persistent)
     $parent = [System.IO.Path]::GetDirectoryName($Path)
     Assert-MigrationTarget $parent 'MigrationManifest'
     $null = [System.IO.Directory]::CreateDirectory($parent)
     $lockPath = $Path + '.lock'
     Assert-MigrationTarget $lockPath 'MigrationManifest'
-    $stream = New-Object System.IO.FileStream -ArgumentList @($lockPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
-    return [pscustomobject]@{ Path = $lockPath; Stream = $stream }
+    $mode = [System.IO.FileMode]::CreateNew
+    if ($Persistent) { $mode = [System.IO.FileMode]::OpenOrCreate }
+    $stream = New-Object System.IO.FileStream -ArgumentList @($lockPath, $mode, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+    return [pscustomobject]@{ Path = $lockPath; Stream = $stream; Persistent = [bool]$Persistent }
 }
 
 function Close-MigrationManifestLock {
@@ -860,7 +863,7 @@ function Close-MigrationManifestLock {
     try {
         $Lock.Stream.Dispose()
         Assert-MigrationTarget $Lock.Path 'MigrationManifest'
-        [System.IO.File]::Delete($Lock.Path)
+        if (-not (Get-MigrationValue $Lock @('Persistent') $false)) { [System.IO.File]::Delete($Lock.Path) }
     }
     catch {
         Write-Warning ('未能移除本次清单锁 {0}：{1}。确认没有迁移进程运行后才可人工移除锁文件。' -f $Lock.Path, $_.Exception.Message)
@@ -905,7 +908,7 @@ function Get-MigrationVerifiedJunction {
     $targets = @(Get-MigrationValue $entry @('Target') @())
     if ($targets.Count -ne 1) { throw '联接目标不唯一。' }
     $actualTarget = [string]$targets[0]
-    if ($actualTarget.StartsWith('\??\')) { $actualTarget = $actualTarget.Substring(4) }
+    if ($actualTarget.StartsWith(('\' + [char]63 + [char]63 + '\'))) { $actualTarget = $actualTarget.Substring(4) }
     if ($actualTarget.TrimEnd('\') -ine $Target) { throw '联接原始目标与清单规范路径不一致，拒绝删除。' }
     $actualTarget = Get-MigrationFullPath $actualTarget
     if ($actualTarget -ine $Target) { throw '联接目标与清单不一致，拒绝删除。' }
