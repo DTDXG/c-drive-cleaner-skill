@@ -3,6 +3,7 @@
     先规划，再由聊天中的第二次确认授权执行分区。
 .DESCRIPTION
     -Plan 不提权；-Apply 代表宿主已取得用户对该方案的第二次确认。
+    加密 C 盘压缩还需用户在聊天中确认能找到恢复密钥，再传 -RecoveryKeyConfirmed。
     Layout 示例（GB 使用 Windows 的 1 GB = 1024^3 字节）：
     {"DiskNumber":0,"Count":2,"Volumes":[{"Label":"资料","SizeGB":100,"Letter":"D",
     "Folders":["文档","下载"]},{"Label":"软件与游戏","SizeGB":"rest","Letter":"E"}]}
@@ -21,13 +22,14 @@ param(
     [Parameter(ParameterSetName = 'Apply')][string]$ResultPath,
     [Parameter(ParameterSetName = 'Apply')][string]$OriginalUserSid,
     [Parameter(ParameterSetName = 'Apply')][switch]$ElevatedChild,
+    [Parameter(ParameterSetName = 'Apply')][switch]$RecoveryKeyConfirmed,
     [Parameter(ParameterSetName = 'Apply', DontShow = $true)][hashtable]$ChildState
 )
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
-# 唯一的加密压缩策略开关。true：C 盘已加密或执行时状态未知，一律不压缩。
-$script:BlockBitLockerProtectedOrUnknownShrink = $true
+# 唯一的加密压缩策略：AllowWithRecoveryKeyConfirmation 或 Block。
+$script:BitLockerShrinkPolicy = 'AllowWithRecoveryKeyConfirmation'
 
 function Get-PcValue {
     param($Object, [string]$Name, $Default = $null)
@@ -203,7 +205,7 @@ function Get-PcFingerprint {
 }
 
 function Get-PcSafety {
-    param($State, $Disk, [bool]$Shrink, [bool]$AtApply, [bool]$BlockEncrypted)
+    param($State, $Disk, [bool]$Shrink, [bool]$AtApply, [string]$BitLockerPolicy = $script:BitLockerShrinkPolicy)
     $blockers = @(); $pending = @(); $warnings = @()
     if (-not (Test-PcInternalDisk $Disk)) { $blockers += '本版本只处理电脑内部硬盘，不处理移动硬盘、U 盘或存储卡。' }
     if ($Disk.IsOffline -or $Disk.IsReadOnly) { $blockers += '选中的硬盘当前离线或只读，不能分区。' }
@@ -220,11 +222,17 @@ function Get-PcSafety {
     }
     if ($Disk.BusType -in @('RAID', 'Spaces')) { $blockers += '这块硬盘使用了多盘组合或存储池，本版本不处理。' }
     if ($Shrink) {
-        if ($BlockEncrypted -and $State.BitLocker -eq 'Protected') { $blockers += 'C 盘已开启磁盘加密，本版本暂不压缩，请先备份并保留现有分区。' }
-        elseif ($BlockEncrypted -and $State.BitLocker -ne 'Off') {
+        if ($State.BitLocker -eq 'Converting') { $blockers += 'C 盘正在加密或解密，完成后才能分区' }
+        elseif ($State.BitLocker -eq 'FullyEncrypted') {
+            if ($BitLockerPolicy -eq 'Block') { $blockers += 'C 盘已开启磁盘加密，本版本暂不压缩，请先备份并保留现有分区。' }
+            elseif ($BitLockerPolicy -ne 'AllowWithRecoveryKeyConfirmation') { $blockers += '无法确认磁盘加密的分区规则，已停止。' }
+        }
+        elseif ($State.BitLocker -ne 'Off') {
             $failure = Get-PcReadFailure 'BitLocker' $AtApply
             if ($failure.Fatal) { $blockers += $failure.Reason } else { $pending += $failure.Reason }
         }
+        $hint = Get-PcRecoveryKeyHint $State.BitLocker
+        if ($hint) { $warnings += $hint }
         if ($null -eq $State.MaxShrinkBytes) {
             $failure = Get-PcReadFailure 'MaxShrink' $AtApply
             if ($failure.Fatal) { $blockers += $failure.Reason }
@@ -257,7 +265,7 @@ function New-PcUnavailablePlan {
     return [pscustomobject]@{ Schema = 'pc-care/partition-plan/1'; GeneratedAt = $Now.ToString('o'); UserSid = $Sid
         Disk = $null; Fingerprint = ''; Situation = 'Unknown'; Mode = 'None'; Feasible = $false; NeedsElevatedRead = $failure.NeedsElevatedRead
         Blockers = @($failure.Reason); PendingChecks = @(); Warnings = @(); Before = @(); After = @(); CAfterBytes = $null
-        NewVolumes = @(); PurposeMappings = @(); UsableBytes = $null; Summary = $failure.Reason; RequiresSecondChatConfirmation = $true
+        NewVolumes = @(); PurposeMappings = @(); UsableBytes = $null; Summary = $failure.Reason; RequiresSecondChatConfirmation = $true; RequiresRecoveryKeyConfirmation = $false; RecoveryKeyHint = ''
         NextStep = 'partition'; Advice = '请先确认管理员权限，再重新检查硬盘布局；当前未修改任何分区。' }
 }
 
@@ -271,9 +279,18 @@ function Get-PcRecoveryWarning {
     }
 }
 
+function Get-PcRecoveryKeyHint {
+    param([string]$BitLockerState)
+    if ($BitLockerState -eq 'FullyEncrypted') {
+        return 'C 盘已加密，请先在聊天中确认能找到恢复密钥。密钥通常在微软账户恢复密钥页面（https://aka.ms/myrecoverykey）、打印件、U 盘或自己保存的文件中。'
+    }
+    if ($BitLockerState -eq 'Unknown') { return '未能读取 C 盘的加密状态；如果你知道 C 盘已加密，请先确认能找到恢复密钥。' }
+    return ''
+}
+
 function New-PcPartitionPlan {
     param($State, [string]$LayoutJson = '', [datetimeoffset]$Now = [datetimeoffset]::Now,
-        [bool]$BlockEncrypted = $true)
+        [string]$BitLockerPolicy = $script:BitLockerShrinkPolicy)
     $blockers = @(); $pending = @(); $warnings = @('操作前请先把重要文件备份到移动硬盘或云盘。', '同一块硬盘上的不同分区不算备份，重要文件仍需另外保留一份。')
     $request = $null; $explicit = $false
     if ($LayoutJson) {
@@ -327,7 +344,7 @@ function New-PcPartitionPlan {
     }
     $new = @(); $mappings = @(); $before = @($disk.Partitions); $after = @($before)
     if ($mode -ne 'None') {
-        $safety = Get-PcSafety $State $disk ($mode -eq 'Shrink') $false $BlockEncrypted
+        $safety = Get-PcSafety $State $disk ($mode -eq 'Shrink') $false $BitLockerPolicy
         $blockers += $safety.Blockers; $pending += $safety.PendingChecks; $warnings += $safety.Warnings
         if ($mode -eq 'Shrink' -and $c.FileSystem -ne 'NTFS') { $blockers += 'C 盘不是受支持的普通文件分区，不能压缩。' }
         $volumes = @(Get-PcValue $request 'Volumes' @())
@@ -371,12 +388,15 @@ function New-PcPartitionPlan {
         if ($mode -eq 'Shrink') { $summary = ('C 盘从 {0:0.#} GB 变成 {1:0.#} GB，新增 ' -f ($c.Size / 1GB), ($cAfter / 1GB)) + $descriptions + '。' }
     }
     if ($blockers.Count -gt 0) { $summary = '暂时不能执行分区方案：' + ($blockers | Select-Object -First 1) }
+    $recoveryKeyHint = ''
+    if ($mode -eq 'Shrink') { $recoveryKeyHint = Get-PcRecoveryKeyHint $State.BitLocker }
     return [pscustomobject]@{ Schema = 'pc-care/partition-plan/1'; GeneratedAt = $Now.ToString('o'); UserSid = [string](Get-PcValue $State 'UserSid' '')
         Disk = [pscustomobject]@{ Number = [int]$disk.Number; UniqueId = $disk.UniqueId; SerialNumber = $disk.SerialNumber; Size = [long]$disk.Size; PartitionStyle = $disk.PartitionStyle }
         Fingerprint = Get-PcFingerprint $State $disk.Number; Situation = $situation; Mode = $mode; Feasible = ($blockers.Count -eq 0); NeedsElevatedRead = ($pending.Count -gt 0)
         Blockers = @($blockers | Select-Object -Unique); PendingChecks = @($pending | Select-Object -Unique); Warnings = @($warnings | Select-Object -Unique)
         Before = @($before); After = @($after); CAfterBytes = $cAfter; NewVolumes = @($new); PurposeMappings = @($mappings)
         UsableBytes = $usable; Summary = $summary; RequiresSecondChatConfirmation = $true
+        RequiresRecoveryKeyConfirmation = ($mode -eq 'Shrink' -and $State.BitLocker -in @('FullyEncrypted', 'Unknown')); RecoveryKeyHint = $recoveryKeyHint
         NextStep = 'move'; Advice = '分区完成后可按目录安排搬家；以后安装软件时请选择软件盘。' }
 }
 
@@ -388,7 +408,7 @@ function Test-PcOverlap {
 }
 
 function Test-PcFrozenPlan {
-    param($PlanObject, $State, [datetimeoffset]$Now = [datetimeoffset]::Now, [bool]$BlockEncrypted = $true)
+    param($PlanObject, $State, [datetimeoffset]$Now = [datetimeoffset]::Now, [string]$BitLockerPolicy = $script:BitLockerShrinkPolicy)
     $reasons = @()
     try {
         if ($PlanObject.Schema -cne 'pc-care/partition-plan/1' -or $PlanObject.Feasible -isnot [bool] -or -not $PlanObject.Feasible) {
@@ -411,7 +431,7 @@ function Test-PcFrozenPlan {
             if (@($PlanObject.NewVolumes).Count -ne 0 -or $PlanObject.CAfterBytes -ne $c.Size) { $reasons += '不分区的方案不能包含磁盘修改。' }
         }
         else {
-            $reasons += (Get-PcSafety $State $disk ($PlanObject.Mode -eq 'Shrink') $true $BlockEncrypted).Blockers
+            $reasons += (Get-PcSafety $State $disk ($PlanObject.Mode -eq 'Shrink') $true $BitLockerPolicy).Blockers
             foreach ($d in $State.Disks) {
                 if (@($d.Partitions | Where-Object { Test-PcDataPartition $d $_ }).Count -gt 0) {
                     $reasons += '现在已有可用的数据分区，请保留布局，改用现有数据盘整理和搬家。'
@@ -579,20 +599,105 @@ function Test-PcAssignLetter {
     return Resolve-PcPartitionLetter $Target.DriveLetter $Letter $UsedLetters
 }
 
+function ConvertFrom-PcShellBitLockerProtection {
+    param($Value)
+    # Shell 枚举与 Get-BitLockerVolume 的枚举不同；只接受整数，避免隐式转换把异常值当成已解密。
+    if ($Value -isnot [byte] -and $Value -isnot [sbyte] -and $Value -isnot [int16] -and $Value -isnot [uint16] -and
+        $Value -isnot [int32] -and $Value -isnot [uint32] -and $Value -isnot [int64] -and $Value -isnot [uint64]) { return 'Unknown' }
+    switch ([string]$Value) {
+        '1' { return 'FullyEncrypted' }
+        '5' { return 'FullyEncrypted' }
+        '2' { return 'Off' }
+        '3' { return 'Converting' }
+        '4' { return 'Converting' }
+        default { return 'Unknown' }
+    }
+}
+
+function ConvertTo-PcBitLockerState {
+    param([string]$VolumeStatus, [string]$ProtectionStatus, $EncryptionPercentage)
+    # 转换状态优先于保护状态：暂停保护不等于已解密。
+    if ($VolumeStatus -in @('EncryptionInProgress', 'DecryptionInProgress', 'EncryptionPaused', 'DecryptionPaused', '2', '3', '4', '5')) { return 'Converting' }
+    $percentage = $null
+    if ($null -ne $EncryptionPercentage) {
+        [decimal]$number = 0
+        if (-not [decimal]::TryParse(([string]$EncryptionPercentage).Replace(',', '.'), [Globalization.NumberStyles]::Number,
+                [Globalization.CultureInfo]::InvariantCulture, [ref]$number) -or $number -lt 0 -or $number -gt 100) { return 'Unknown' }
+        $percentage = $number
+        if ($percentage -gt 0 -and $percentage -lt 100) { return 'Converting' }
+    }
+    if ($VolumeStatus -in @('FullyEncrypted', '1') -and ($null -eq $percentage -or $percentage -eq 100) -and $ProtectionStatus -in @('On', 'Off', '0', '1')) { return 'FullyEncrypted' }
+    if ($VolumeStatus -in @('FullyDecrypted', '0') -and ($null -eq $percentage -or $percentage -eq 0) -and $ProtectionStatus -in @('Off', '0')) { return 'Off' }
+    return 'Unknown'
+}
+
 function ConvertFrom-PcBitLockerStatus {
     param([string]$Text)
-    # 保护暂停仍可能是加密盘：必须同时证实完全解密和保护关闭。
-    if ($Text -match '(?im)^\s*(?:Protection Status|保护状态)\s*[:：]\s*(?:Protection On|保护打开|保护开启|开启|打开)\s*$') { return 'Protected' }
-    if ($Text -match '(?im)^\s*(?:Conversion Status|转换状态)\s*[:：]\s*(?:Fully Decrypted|完全解密|已完全解密)\s*$' -and
-        $Text -match '(?im)^\s*(?:Protection Status|保护状态)\s*[:：]\s*(?:Protection Off|保护关闭|关闭)\s*$') { return 'Off' }
-    if ($Text -match '(?im)^\s*(?:Conversion Status|转换状态)\s*[:：].*(?:Encrypted|Encryption|Decryption|加密|正在解密|解密中)' -or
-        $Text -match '(?im)^\s*(?:Percentage Encrypted|已加密百分比|加密百分比)\s*[:：]\s*(?:[1-9]\d*(?:[.,]\d+)?|0[.,]\d*[1-9]\d*)\s*%') { return 'Protected' }
-    return 'Unknown'
+    $volume = ''; $protection = ''; $percentage = $null
+    if ($Text -match '(?im)^\s*(?:Conversion Status|转换状态)\s*[:：]\s*(.+?)\s*$') {
+        $status = $Matches[1]
+        switch -Regex ($status) {
+            '^(Fully Encrypted|完全加密|已完全加密|仅已用空间加密|仅已用空间已加密|仅加密已用空间|Used Space Only Encrypted)$' { $volume = 'FullyEncrypted'; break }
+            '^(Fully Decrypted|完全解密|已完全解密)$' { $volume = 'FullyDecrypted'; break }
+            '(Encryption|Decryption).*(Progress|Paused)|加密.*(进行|暂停|已暂停)|解密.*(进行|暂停|已暂停)|正在(加密|解密)|(加密|解密)中' { $volume = 'EncryptionInProgress'; break }
+        }
+    }
+    if ($Text -match '(?im)^\s*(?:Protection Status|保护状态)\s*[:：]\s*(?:Protection On|保护打开|保护开启|保护已打开|保护已开启|保护已启用|开启|打开)[ \t]*(?:[(（][^\r\n]*[)）])?[ \t]*\r?$') { $protection = 'On' }
+    elseif ($Text -match '(?im)^\s*(?:Protection Status|保护状态)\s*[:：]\s*(?:Protection Off|保护关闭|保护已关闭|保护已禁用|关闭)[ \t]*(?:[(（][^\r\n]*[)）])?[ \t]*\r?$') { $protection = 'Off' }
+    if ($Text -match '(?im)^\s*(?:Percentage Encrypted|已加密百分比|加密百分比)\s*[:：]\s*([0-9]+(?:[.,][0-9]+)?)\s*%\s*$') { $percentage = $Matches[1] }
+    return ConvertTo-PcBitLockerState $volume $protection $percentage
+}
+
+function ConvertTo-PcProtectorTypes {
+    param($Protectors)
+    # 仅提取已知类型；原对象可能带恢复密码，禁止回传或序列化。
+    $types = @(); $known = ($null -ne $Protectors)
+    $names = @('Unknown', 'Tpm', 'ExternalKey', 'RecoveryPassword', 'TpmPin', 'TpmStartupKey', 'TpmPinAndStartupKey', 'PublicKey', 'Passphrase', 'TpmCertificate', 'SidProtector')
+    foreach ($p in @($Protectors)) {
+        $type = [string](Get-PcValue $p 'KeyProtectorType' '')
+        [int]$number = -1
+        if ([int]::TryParse($type, [ref]$number) -and $number -ge 0 -and $number -lt $names.Count) { $type = $names[$number] }
+        if ($type -notin $names -or $type -eq 'Unknown') { $known = $false }
+        else { $types += $type }
+    }
+    return [pscustomobject]@{ Known = $known; Types = @($types | Select-Object -Unique) }
+}
+
+function ConvertFrom-PcProtectorStatus {
+    param([string]$Text)
+    # manage-bde 的密码行只在内存中经过；只返回固定类型名。
+    $types = @(); $candidates = @()
+    $headings = [ordered]@{
+        RecoveryPassword = 'Numerical Password|Recovery Password|数字密码|恢复密码'
+        Tpm = 'TPM'; ExternalKey = 'External Key|外部密钥'
+        TpmPin = 'TPM And PIN|TPM 和 PIN'; TpmStartupKey = 'TPM And Startup Key|TPM 和启动密钥'
+        TpmPinAndStartupKey = 'TPM And PIN And Startup Key|TPM 和 PIN 和启动密钥'
+        PublicKey = 'Certificate|证书'; Passphrase = 'Password|密码'; SidProtector = 'Identity|标识'
+    }
+    foreach ($name in $headings.Keys) {
+        foreach ($match in [regex]::Matches($Text, ('(?im)^(?<indent>[ \t]*)(?:' + $headings[$name] + ')[ \t]*[:：][ \t]*\r?$'))) {
+            $candidates += [pscustomobject]@{ Type = $name; Indent = $match.Groups['indent'].Value.Length }
+        }
+    }
+    if ($candidates.Count -gt 0) {
+        # 数字密码下面还会有更深缩进的 Password 字段，它不是另一个保护器。
+        $indent = @($candidates | Sort-Object Indent)[0].Indent
+        $types = @($candidates | Where-Object { $_.Indent -eq $indent } | ForEach-Object { $_.Type } | Select-Object -Unique)
+    }
+    $empty = $Text -match '(?im)^\s*(?:None Found[.]?|未找到(?:任何)?密钥保护器[。.]?|找不到密钥保护器[。.]?)\s*$'
+    return [pscustomobject]@{ Known = ($types.Count -gt 0 -or $empty); Types = @($types) }
+}
+
+function Get-PcRecoveryProtectorReason {
+    param($Protectors)
+    if (-not [bool](Get-PcValue $Protectors 'Known' $false)) { return '无法确认这台电脑是否有磁盘加密恢复密钥，不能安全分区。' }
+    if ('RecoveryPassword' -notin @(Get-PcValue $Protectors 'Types' @())) { return '这台电脑的磁盘加密没有恢复密钥，万一需要时无法解锁，本版本不分区' }
+    return ''
 }
 
 function Invoke-PcPartitionExecution {
     [CmdletBinding(SupportsShouldProcess = $true)]
-    param($PlanObject, $State, $Context, [bool]$BlockEncrypted = $true, [hashtable]$ChildState)
+    param($PlanObject, $State, $Context, [string]$BitLockerPolicy = $script:BitLockerShrinkPolicy, [hashtable]$ChildState, [switch]$RecoveryKeyConfirmed)
     $runId = [guid]::NewGuid().ToString('N'); $steps = @(Get-PcPartitionSteps $PlanObject)
     $result = [pscustomobject]@{ Schema = 'pc-care/partition/1'; GeneratedAt = [datetimeoffset]::Now.ToString('o'); RunId = $runId
         UserSid = $Context.CurrentUserSid; Status = 'Done'; Reason = ''; StoppedAt = $null; Steps = @(); CreatedPartitions = @(); FinalLayout = @(); UnassignedFormattedPartitions = @()
@@ -603,10 +708,19 @@ function Invoke-PcPartitionExecution {
         foreach ($step in $steps) { Write-Host ('将执行：' + $step.Description); $result.Steps += [pscustomobject]@{ Id = $step.Id; VolumeIndex = $step.VolumeIndex; Status = 'WhatIf'; Description = $step.Description } }
         return $result
     }
-    $validation = Test-PcFrozenPlan $PlanObject $State -BlockEncrypted:$BlockEncrypted
+    $validation = Test-PcFrozenPlan $PlanObject $State -BitLockerPolicy $BitLockerPolicy
     if (-not $validation.Valid) { $result.Status = 'Refused'; $result.StoppedAt = 'Preflight'; $result.Reason = $validation.Reasons -join '；'; return $result }
     if (-not $Context.IsAdmin -or ($Context.CurrentUserSid -cne $PlanObject.UserSid)) {
         $result.Status = 'Skipped'; $result.StoppedAt = 'Elevation'; $result.Reason = '未取得原账户的管理员权限，已跳过分区。'; return $result
+    }
+    if ($PlanObject.Mode -eq 'Shrink' -and $State.BitLocker -eq 'FullyEncrypted') {
+        if (-not $RecoveryKeyConfirmed) {
+            $result.Status = 'NeedsRecoveryKeyConfirmation'; $result.StoppedAt = 'Preflight'
+            $result.Reason = 'C 盘已加密，请先在聊天中确认你能找到恢复密钥，再执行分区；未修改任何分区。'
+            return $result
+        }
+        $reason = Get-PcRecoveryProtectorReason (Read-PcRecoveryProtectors $Context)
+        if ($reason) { $result.Status = 'Refused'; $result.StoppedAt = 'Preflight'; $result.Reason = $reason; return $result }
     }
     if (-not $PSCmdlet.ShouldProcess($PlanObject.Summary, '执行已在聊天中二次确认的分区方案')) { $result.Status = 'Skipped'; $result.Reason = '未执行分区。'; return $result }
     $disk = @($State.Disks | Where-Object { $_.Number -eq $PlanObject.Disk.Number })[0]
@@ -776,18 +890,39 @@ function Read-PcUsedLetters {
     catch { throw '无法确认当前可用的盘符，已停止；请先检查当前布局。' }
 }
 
+function Read-PcShellBitLockerProtection {
+    if ($WhatIfPreference) { return $null }
+    $shell = $null; $folder = $null; $item = $null
+    try {
+        $shell = New-Object -ComObject Shell.Application -ErrorAction Stop
+        $folder = $shell.NameSpace('C:')
+        $item = $folder.Self
+        return ,($item.ExtendedProperty('System.Volume.BitLockerProtection'))
+    }
+    catch { return $null }
+    finally {
+        foreach ($com in @($item, $folder, $shell)) {
+            try { if ($null -ne $com -and [Runtime.InteropServices.Marshal]::IsComObject($com)) { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($com) } }
+            catch { }
+        }
+    }
+}
+
 function Read-PcBitLocker {
     param($Context)
+    if ($WhatIfPreference) { return 'Unknown' }
+    # 普通权限只读 Shell 属性；执行阶段仍须由原有管理员接口得出肯定结论。
+    if (-not [bool](Get-PcValue $Context 'IsAdmin' $false)) {
+        return ConvertFrom-PcShellBitLockerProtection (Read-PcShellBitLockerProtection)
+    }
     if ($null -ne (Get-Command Get-BitLockerVolume -ErrorAction SilentlyContinue)) {
         try {
             $b = Get-BitLockerVolume -MountPoint 'C:' -ErrorAction Stop
-            if ([string]$b.VolumeStatus -eq 'FullyDecrypted' -and [string]$b.ProtectionStatus -in @('Off', '0') -and $b.EncryptionPercentage -eq 0) { return 'Off' }
-            if ([string]$b.VolumeStatus -in @('FullyEncrypted', 'EncryptionInProgress', 'DecryptionInProgress', 'EncryptionPaused', 'DecryptionPaused') -or
-                [string]$b.ProtectionStatus -in @('On', '1') -or $b.EncryptionPercentage -gt 0) { return 'Protected' }
+            $state = ConvertTo-PcBitLockerState ([string](Get-PcValue $b 'VolumeStatus' '')) ([string](Get-PcValue $b 'ProtectionStatus' '')) (Get-PcValue $b 'EncryptionPercentage')
+            if ($state -ne 'Unknown') { return $state }
         }
         catch { }
     }
-    if ($WhatIfPreference) { return 'Unknown' }
     try {
         $directory = [Environment]::SystemDirectory
         if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess) { $directory = Join-Path $Context.SystemRoot 'Sysnative' }
@@ -796,6 +931,34 @@ function Read-PcBitLocker {
         return ConvertFrom-PcBitLockerStatus $r.StandardOutput
     }
     catch { return 'Unknown' }
+}
+
+function Read-PcRecoveryProtectors {
+    param($Context)
+    if ($WhatIfPreference) { return [pscustomobject]@{ Known = $false; Types = @() } }
+    try {
+        $b = Get-BitLockerVolume -MountPoint 'C:' -ErrorAction Stop
+        # 直接取属性以保留已知的空数组；普通管道会把空数组变成 null。
+        if ($b -is [Collections.IDictionary]) { $protectors = $b['KeyProtector'] }
+        else { $protectors = $b.KeyProtector }
+        $types = ConvertTo-PcProtectorTypes $protectors
+        if ($types.Known) { return $types }
+    }
+    catch { }
+    try {
+        $directory = [Environment]::SystemDirectory
+        if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess) { $directory = Join-Path $Context.SystemRoot 'Sysnative' }
+        $encoding = [Text.Encoding]::GetEncoding([Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage)
+        # Invoke-External 的失败审计默认带原始 stderr；本查询可能含密码，
+        # 在本地作用域替换审计入口，只记录固定说明，绝不记录工具输出或异常。
+        function Write-CleanerAudit {
+            param($Action, $Path, $Result, $Bytes, $Message, $Context)
+            Write-CleanerLog -Action 'Partition:RecoveryProtectorCheck' -Path 'C:' -Result $Result -Message '只读检查磁盘加密恢复密钥类型。' -Context $Context -Confirm:$false
+        }
+        $r = Invoke-External -FilePath (Join-Path $directory 'manage-bde.exe') -ArgumentList @('-protectors', '-get', 'C:') -Description '只读检查磁盘加密恢复密钥类型' -Context $Context -OutputEncoding $encoding -Confirm:$false
+        return ConvertFrom-PcProtectorStatus $r.StandardOutput
+    }
+    catch { return [pscustomobject]@{ Known = $false; Types = @() } }
 }
 
 function Read-PcPartitionState {
@@ -964,10 +1127,11 @@ function ConvertTo-PcLiteral {
 }
 
 function New-PcElevationCommand {
-    param([string]$ScriptPath, [string]$InputPath, [string]$OutputPath, [string]$Sid)
+    param([string]$ScriptPath, [string]$InputPath, [string]$OutputPath, [string]$Sid, [switch]$RecoveryKeyConfirmed)
+    $confirmation = ''; if ($RecoveryKeyConfirmed) { $confirmation = ' -RecoveryKeyConfirmed' }
     # 13：换账户；12：捕获异常且尚未进入磁盘步骤；21：步骤可能已运行。其他退出码不能证明未修改。
     return ('$ErrorActionPreference = ''Stop''; $childState = @{ StepMayHaveRun = $false }; try { if ([Security.Principal.WindowsIdentity]::GetCurrent().User.Value -cne ' + (ConvertTo-PcLiteral $Sid) + ') { exit 13 }; & ' + (ConvertTo-PcLiteral $ScriptPath) + ' -Apply -ElevatedChild -PlanPath ' + (ConvertTo-PcLiteral $InputPath) +
-        ' -ResultPath ' + (ConvertTo-PcLiteral $OutputPath) + ' -OriginalUserSid ' + (ConvertTo-PcLiteral $Sid) + ' -ChildState $childState -Confirm:$false -WhatIf:$false; exit 0 } catch { if ($childState.StepMayHaveRun) { exit 21 }; exit 12 }')
+        ' -ResultPath ' + (ConvertTo-PcLiteral $OutputPath) + ' -OriginalUserSid ' + (ConvertTo-PcLiteral $Sid) + $confirmation + ' -ChildState $childState -Confirm:$false -WhatIf:$false; exit 0 } catch { if ($childState.StepMayHaveRun) { exit 21 }; exit 12 }')
 }
 
 function Get-PcElevationArguments {
@@ -1008,7 +1172,7 @@ function Get-PcMissingChildResult {
 
 function Invoke-PcPartitionMain {
     param([string]$ScriptPath, [bool]$Planning, [string]$LayoutJson, [string]$InputPath, [string]$OutputPath,
-        [string]$ExpectedSid, [bool]$Child, [bool]$DryRun, [bool]$BlockEncrypted, [hashtable]$ChildState)
+        [string]$ExpectedSid, [bool]$Child, [bool]$DryRun, [string]$BitLockerPolicy = $script:BitLockerShrinkPolicy, [hashtable]$ChildState, [switch]$RecoveryKeyConfirmed)
     if ($DryRun) {
         if ($Planning) { Write-Host '演练：只读规划并新建方案文件；当前不会写入文件。'; return }
         try {
@@ -1026,7 +1190,7 @@ function Invoke-PcPartitionMain {
         try {
             if ($null -eq $context) { throw '无法读取当前账户信息。' }
             $state = Read-PcPartitionState $context
-            $p = New-PcPartitionPlan $state $LayoutJson -BlockEncrypted:$BlockEncrypted
+            $p = New-PcPartitionPlan $state $LayoutJson -BitLockerPolicy $BitLockerPolicy
         }
         catch { $p = New-PcUnavailablePlan ([string](Get-PcValue $context 'CurrentUserSid' '')) }
         $path = Get-PcOutputPath $InputPath 'partition-plan' $context
@@ -1039,7 +1203,7 @@ function Invoke-PcPartitionMain {
         $r = New-PcSkippedResult '提权使用了另一个账户，已跳过分区，未修改任何分区；请使用原账户确认权限。' $context.CurrentUserSid
     }
     elseif (-not $context.IsAdmin -and -not $Child) {
-        $command = New-PcElevationCommand $ScriptPath ([IO.Path]::GetFullPath($InputPath)) $path $context.CurrentUserSid
+        $command = New-PcElevationCommand $ScriptPath ([IO.Path]::GetFullPath($InputPath)) $path $context.CurrentUserSid -RecoveryKeyConfirmed:$RecoveryKeyConfirmed
         try { $exitCode = Start-PcElevatedApply $command }
         catch {
             $r = New-PcSkippedResult '没有获得管理员权限，已跳过分区。' $context.CurrentUserSid
@@ -1062,7 +1226,7 @@ function Invoke-PcPartitionMain {
         try {
             $p = Read-PcJson $InputPath
             $state = Read-PcPartitionState $context
-            $r = Invoke-PcPartitionExecution $p $state $context -BlockEncrypted:$BlockEncrypted -ChildState $ChildState -Confirm:$false
+            $r = Invoke-PcPartitionExecution $p $state $context -BitLockerPolicy $BitLockerPolicy -ChildState $ChildState -RecoveryKeyConfirmed:$RecoveryKeyConfirmed -Confirm:$false
         }
         catch {
             if ($ChildState.StepMayHaveRun) { $r = New-PcSkippedResult '分区操作后无法完整核实结果，已停止；请先检查磁盘状态，不要重复执行。' $context.CurrentUserSid 'Failed' }
@@ -1076,4 +1240,4 @@ function Invoke-PcPartitionMain {
 if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) { throw '分区规划仅支持 Windows 10 和 Windows 11。' }
 . (Join-Path $PSScriptRoot 'common.ps1')
 Invoke-PcPartitionMain -ScriptPath $PSCommandPath -Planning ([bool]$Plan) -LayoutJson $Layout -InputPath $PlanPath -OutputPath $ResultPath `
-    -ExpectedSid $OriginalUserSid -Child ([bool]$ElevatedChild) -DryRun ([bool]$WhatIfPreference) -BlockEncrypted $script:BlockBitLockerProtectedOrUnknownShrink -ChildState $ChildState
+    -ExpectedSid $OriginalUserSid -Child ([bool]$ElevatedChild) -DryRun ([bool]$WhatIfPreference) -BitLockerPolicy $script:BitLockerShrinkPolicy -RecoveryKeyConfirmed:$RecoveryKeyConfirmed -ChildState $ChildState

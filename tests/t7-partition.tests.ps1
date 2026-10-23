@@ -6,8 +6,12 @@ $ast = [Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [
 if ($errors.Count -ne 0) { throw ($errors.Message -join '; ') }
 # 只载入函数，绝不执行脚本体或 Windows API；适配器在下面用内存假实现替换。
 foreach ($definition in @($ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] }, $true))) {
-    . ([scriptblock]::Create($definition.Extent.Text))
+    if ($definition.Name -ne 'Write-CleanerAudit') { . ([scriptblock]::Create($definition.Extent.Text)) }
 }
+# 只读取顶层策略赋值的 AST，仍不执行脚本体。
+$policyAssignments = @($ast.FindAll({ param($n) $n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$script:BitLockerShrinkPolicy' }, $true))
+if ($policyAssignments.Count -ne 1) { throw '必须只有一个默认加密策略定义。' }
+$script:BitLockerShrinkPolicy = $policyAssignments[0].Right.Find({ param($n) $n -is [Management.Automation.Language.StringConstantExpressionAst] }, $true).Value
 $script:assertions = 0
 function Assert-True {
     param([bool]$Condition, [string]$Message)
@@ -183,16 +187,16 @@ Assert-True (($p.Warnings -join '') -match 'Windows 确认') 'P2 标明执行时
 Assert-Refused $p $s 'P2 提权后仍未知拒绝'
 $s.BitLocker = 'Off'; $s.MaxShrinkBytes = 340GB; $s.Disks[0].IsDynamic = $false; $s.Disks[0].IsStorageSpaces = $false
 Assert-True (Test-PcFrozenPlan $p $s).Valid 'P2 所有待确认现在通过即允许'
-foreach ($state in @('Protected', 'Unknown')) {
+foreach ($state in @('Converting', 'Unknown')) {
     $s.BitLocker = $state; Assert-Refused $p $s ('P2 默认加密策略 ' + $state)
 }
-$s.BitLocker = 'Protected'
-Assert-True (Test-PcFrozenPlan $p $s -BlockEncrypted:$false).Valid '单行策略开关可以改变加密限制'
+$s.BitLocker = 'FullyEncrypted'
+Assert-True (Test-PcFrozenPlan $p $s -BitLockerPolicy 'AllowWithRecoveryKeyConfirmation').Valid '单行策略开关可以改变加密限制'
 foreach ($field in @('IsDynamic', 'IsStorageSpaces')) {
     $s = New-TestState; $p = New-PcPartitionPlan $s; $s.Disks[0].$field = $true
     Assert-Refused $p $s ($field + ' 执行硬阻断')
     Assert-True (-not (New-PcPartitionPlan $s).Feasible) ($field + ' 规划硬阻断')
-    Assert-True (-not (Test-PcFrozenPlan $p $s -BlockEncrypted:$false).Valid) ($field + ' 不受加密策略影响')
+    Assert-True (-not (Test-PcFrozenPlan $p $s -BitLockerPolicy 'AllowWithRecoveryKeyConfirmation').Valid) ($field + ' 不受加密策略影响')
 }
 $s = New-TestState; $s.Disks[0].BusType = 'RAID'
 Assert-True (-not (New-PcPartitionPlan $s).Feasible) 'RAID 规划拒绝'
@@ -201,8 +205,154 @@ $s.Disks[0].Size += 500MB; $p = New-PcPartitionPlan $s
 Assert-True (($p.Warnings -join '') -match '以后不能直接扩大 C 盘') '恢复分区紧接 C 的警告'
 Assert-Equal (ConvertFrom-PcBitLockerStatus "Conversion Status: Fully Decrypted`nProtection Status: Protection Off") 'Off' '英文加密状态解析'
 Assert-Equal (ConvertFrom-PcBitLockerStatus "转换状态：完全解密`n保护状态：保护关闭") 'Off' '中文加密状态解析'
-Assert-Equal (ConvertFrom-PcBitLockerStatus "Conversion Status: Fully Encrypted`nProtection Status: Protection Off") 'Protected' '暂停保护仍加密'
+Assert-Equal (ConvertFrom-PcBitLockerStatus "Conversion Status: Fully Encrypted`nProtection Status: Protection Off") 'FullyEncrypted' '暂停保护仍加密'
 Assert-Equal (ConvertFrom-PcBitLockerStatus 'Access is denied') 'Unknown' '读取失败不当未加密'
+
+# B1/B2/B3：每种状态 × 两种策略的规划 / 实时检查，不信任方案里的确认标记。
+Assert-Equal $script:BitLockerShrinkPolicy 'AllowWithRecoveryKeyConfirmation' 'B1 默认策略来自唯一常量'
+foreach ($policy in @('AllowWithRecoveryKeyConfirmation', 'Block')) {
+    foreach ($stateName in @('Off', 'FullyEncrypted', 'Converting', 'Unknown')) {
+        $state = New-TestState; $state.BitLocker = $stateName
+        $planObject = New-PcPartitionPlan $state -BitLockerPolicy $policy
+        $feasible = $stateName -in @('Off', 'Unknown') -or ($stateName -eq 'FullyEncrypted' -and $policy -ne 'Block')
+        Assert-Equal $planObject.Feasible $feasible ('B2 Plan ' + $stateName + '/' + $policy)
+        Assert-Equal $planObject.RequiresRecoveryKeyConfirmation ($stateName -in @('FullyEncrypted', 'Unknown')) ('B3/UX2 找回密钥标志 ' + $stateName + '/' + $policy)
+        Assert-Equal ([bool]$planObject.RecoveryKeyHint) $planObject.RequiresRecoveryKeyConfirmation ('UX4 仅需确认时提供提示 ' + $stateName)
+        Assert-Equal ($planObject.PendingChecks.Count -gt 0) ($stateName -eq 'Unknown') ('B2 未知待检查 ' + $stateName + '/' + $policy)
+        $frozen = New-PcPartitionPlan (New-TestState)
+        $valid = $stateName -eq 'Off' -or ($stateName -eq 'FullyEncrypted' -and $policy -ne 'Block')
+        Assert-Equal (Test-PcFrozenPlan $frozen $state -BitLockerPolicy $policy).Valid $valid ('B2 Apply 实时状态 ' + $stateName + '/' + $policy)
+        if ($stateName -eq 'FullyEncrypted') {
+            foreach ($fragment in @('https://aka.ms/myrecoverykey', '打印件', 'U 盘', '保存的文件', '先在聊天中确认')) {
+                Assert-True ($planObject.RecoveryKeyHint -match [regex]::Escape($fragment)) ('B3 明确找回密钥位置 ' + $fragment)
+            }
+        }
+        elseif ($stateName -eq 'Unknown') {
+            Assert-Equal $planObject.RecoveryKeyHint '未能读取 C 盘的加密状态；如果你知道 C 盘已加密，请先确认能找到恢复密钥。' 'UX2 未知时只向知道已加密的用户请求确认'
+        }
+        else { Assert-True (($planObject.Warnings -join '') -notmatch '恢复密钥') 'B3 未加密不加密钥步骤' }
+        if ($planObject.RequiresRecoveryKeyConfirmation) { Assert-True ($planObject.RecoveryKeyHint -cin $planObject.Warnings) 'UX4 代理可以逐字转述同一提示' }
+        if ($stateName -eq 'Converting') { Assert-True (($planObject.Blockers -join '') -match 'C 盘正在加密或解密，完成后才能分区') 'B2 转换中说明原因' }
+        foreach ($createKind in @('Unallocated', 'EmptyDisk')) {
+            if ($createKind -eq 'Unallocated') { $state.Disks[0].Size += 100GB }
+            else { $state = New-TestState; $state.BitLocker = $stateName; $state.Disks += New-TestDisk 1 @() 1TB 'SATA' }
+            $create = New-PcPartitionPlan $state -BitLockerPolicy $policy
+            Assert-Equal $create.Mode 'Create' ('B5 创建模式 ' + $createKind)
+            Assert-True ($create.Feasible -and -not $create.RequiresRecoveryKeyConfirmation) ('B5 创建不需密钥 ' + $stateName + '/' + $policy)
+            Assert-Equal $create.RecoveryKeyHint '' 'UX4 创建模式没有密钥提示'
+            Assert-True (Test-PcFrozenPlan $create $state -BitLockerPolicy $policy).Valid ('B5 创建无需加密检查 ' + $createKind)
+            Assert-True (($create.Warnings -join '') -notmatch '恢复密钥') 'B5 创建不提示密钥'
+        }
+    }
+}
+
+# UX1/UX2/UX4：纯映射 + 真正的 Shell 包装器绑定内存 COM 假对象，再生成 Plan。
+& {
+    $script:shellValue = $null; $script:shellFailure = ''; $script:shellCalls = 0; $script:adminReads = 0
+    $item = [pscustomobject]@{}
+    $item | Add-Member ScriptMethod ExtendedProperty {
+        param($Name)
+        Assert-Equal $Name 'System.Volume.BitLockerProtection' 'UX1 只读取 Shell 加密属性'
+        if ($script:shellFailure -eq 'Property') { throw 'Property unavailable' }
+        return ,$script:shellValue
+    }
+    $folder = [pscustomobject]@{ Self = $item }
+    $shell = [pscustomobject]@{ Folder = $folder }
+    $shell | Add-Member ScriptMethod NameSpace {
+        param($Path)
+        Assert-Equal $Path 'C:' 'UX1 Shell 只读取 C 盘'
+        if ($script:shellFailure -eq 'Namespace') { throw 'Namespace unavailable' }
+        if ($script:shellFailure -eq 'MissingFolder') { return $null }
+        return $this.Folder
+    }
+    $script:fakeShell = $shell
+    function New-Object {
+        [CmdletBinding()]param([string]$ComObject)
+        $script:shellCalls++
+        Assert-Equal $ComObject 'Shell.Application' 'UX1 创建 Windows Shell'
+        if ($script:shellFailure -eq 'Create') { throw 'COM unavailable' }
+        return $script:fakeShell
+    }
+    function Get-BitLockerVolume { $script:adminReads++; throw '不得调用管理员接口' }
+    function Invoke-External { $script:adminReads++; throw '不得运行管理员工具' }
+    $queryContext = @{ IsAdmin = $false }
+    foreach ($case in @(
+        @{ Value = 0; Expected = 'Unknown' },
+        @{ Value = 1; Expected = 'FullyEncrypted' },
+        @{ Value = 2; Expected = 'Off' },
+        @{ Value = 3; Expected = 'Converting' },
+        @{ Value = 4; Expected = 'Converting' },
+        @{ Value = 5; Expected = 'FullyEncrypted' },
+        @{ Value = 6; Expected = 'Unknown' },
+        @{ Value = $null; Expected = 'Unknown' },
+        @{ Value = -1; Expected = 'Unknown' },
+        @{ Value = 99; Expected = 'Unknown' },
+        @{ Value = 'unexpected'; Expected = 'Unknown' },
+        @{ Value = '2'; Expected = 'Unknown' },
+        @{ Value = $true; Expected = 'Unknown' },
+        @{ Value = 2.1; Expected = 'Unknown' },
+        @{ Value = @(2); Expected = 'Unknown' },
+        @{ Value = [pscustomobject]@{ Value = 2 }; Expected = 'Unknown' }
+    )) {
+        Assert-Equal (ConvertFrom-PcShellBitLockerProtection $case.Value) $case.Expected ('UX1 映射 ' + [string]$case.Value)
+        $script:shellValue = $case.Value
+        $state = New-TestState; $state.BitLocker = Read-PcBitLocker $queryContext
+        Assert-Equal $state.BitLocker $case.Expected ('UX1 普通权限 Shell 读取 ' + [string]$case.Value)
+        $planObject = New-PcPartitionPlan $state
+        Assert-Equal $planObject.RequiresRecoveryKeyConfirmation ($case.Expected -in @('FullyEncrypted', 'Unknown')) 'UX2 Shell 规划确认标记'
+        Assert-Equal $planObject.Feasible ($case.Expected -ne 'Converting') 'UX1 转换中仍阻止分区'
+        Assert-Equal ([bool]$planObject.RecoveryKeyHint) $planObject.RequiresRecoveryKeyConfirmation 'UX4 Shell 规划提示'
+        if ($case.Expected -eq 'Off') { Assert-True (($planObject.Warnings -join '') -notmatch '恢复密钥') 'UX2 Shell Off 不产生密钥警告' }
+        if ($case.Expected -eq 'Unknown') { Assert-True ($planObject.RecoveryKeyHint -match '未能读取.*如果你知道 C 盘已加密') 'UX2 Shell Unknown 条件式提示' }
+    }
+    foreach ($value in @([byte]2, [sbyte]2, [int16]2, [uint16]2, [uint32]2, [int64]2, [uint64]2)) {
+        Assert-Equal (ConvertFrom-PcShellBitLockerProtection $value) 'Off' 'UX1 不同整数类型枚举'
+    }
+    foreach ($failure in @('Create', 'Namespace', 'MissingFolder', 'Property')) {
+        $script:shellFailure = $failure
+        $output = @(Read-PcBitLocker $queryContext *>&1)
+        Assert-Equal $output.Count 1 ('UX1 包装器失败不泄露异常 ' + $failure)
+        Assert-Equal $output[0] 'Unknown' ('UX1 包装器失败保留未知 ' + $failure)
+        $state = New-TestState; $state.BitLocker = $output[0]
+        $planObject = New-PcPartitionPlan $state
+        Assert-True ($planObject.Feasible -and $planObject.RequiresRecoveryKeyConfirmation) 'UX2 包装器失败仍能生成待检查方案'
+    }
+    Assert-Equal $script:adminReads 0 'UX1 普通权限从不尝试管理员接口或工具'
+    $callsBefore = $script:shellCalls; $WhatIfPreference = $true
+    Assert-Equal (Read-PcBitLocker $queryContext) 'Unknown' 'UX1 WhatIf 不读取 Shell'
+    Assert-Equal (Read-PcShellBitLockerProtection) $null 'UX1 Shell 包装器也遵守 WhatIf'
+    Assert-Equal $script:shellCalls $callsBefore 'UX1 WhatIf 没有创建 COM'
+}
+
+# B2：两种语言的完成、暂停保护、转换和转换暂停；百分比不能覆盖正在转换的状态。
+foreach ($protection in @('On', 'Off')) {
+    Assert-Equal (ConvertFrom-PcBitLockerStatus ("Conversion Status: Fully Encrypted`nProtection Status: Protection " + $protection + "`nPercentage Encrypted: 100.0%")) 'FullyEncrypted' ('B2 英文完成保护 ' + $protection)
+    Assert-Equal (ConvertTo-PcBitLockerState 'FullyEncrypted' $protection 100) 'FullyEncrypted' ('B2 原生完成保护 ' + $protection)
+}
+foreach ($text in @('完全加密', '已完全加密', '仅已用空间已加密', '仅加密已用空间')) {
+    foreach ($protection in @('保护开启', '保护关闭')) {
+        Assert-Equal (ConvertFrom-PcBitLockerStatus ("转换状态：$text`n保护状态：$protection`n已加密百分比：100.0%")) 'FullyEncrypted' ('B2 中文加密 ' + $text + '/' + $protection)
+    }
+}
+foreach ($conversion in @('Encryption in Progress', 'Decryption in Progress', 'Encryption Paused', 'Decryption Paused', '正在加密', '正在解密', '加密已暂停', '解密已暂停', '加密进行中', '解密进行中')) {
+    Assert-Equal (ConvertFrom-PcBitLockerStatus ("Conversion Status: $conversion`nProtection Status: Protection On`nPercentage Encrypted: 100%")) 'Converting' ('B2 英文和中文转换 ' + $conversion)
+}
+foreach ($conversion in @('EncryptionInProgress', 'DecryptionInProgress', 'EncryptionPaused', 'DecryptionPaused', '2', '3', '4', '5')) {
+    foreach ($protection in @('On', 'Off', 'Unknown')) {
+        Assert-Equal (ConvertTo-PcBitLockerState $conversion $protection 0) 'Converting' ('B2 原生转换 ' + $conversion + '/' + $protection)
+    }
+}
+Assert-Equal (ConvertTo-PcBitLockerState '0' '0' 0) 'Off' 'B2 原生数字枚举解密'
+Assert-Equal (ConvertTo-PcBitLockerState '1' '1' 100) 'FullyEncrypted' 'B2 原生数字枚举加密'
+Assert-Equal (ConvertTo-PcBitLockerState 'Unknown' 'On' 100) 'Unknown' 'B2 保护打开不能证明转换完成'
+Assert-Equal (ConvertTo-PcBitLockerState 'FullyDecrypted' 'On' 0) 'Unknown' 'B2 矛盾状态不当未加密'
+Assert-Equal (ConvertTo-PcBitLockerState 'Unknown' 'Off' 12.5) 'Converting' 'B2 部分加密必须停止'
+Assert-Equal (ConvertFrom-PcBitLockerStatus "已加密百分比：12,5%`n保护状态：保护关闭") 'Converting' 'B2 百分比与小数逗号'
+Assert-Equal (ConvertTo-PcBitLockerState 'FullyEncrypted' 'Off' 101) 'Unknown' 'B2 无效百分比拒绝'
+Assert-Equal (ConvertFrom-PcBitLockerStatus 'Protection Status: Protection On') 'Unknown' 'B2 只读到保护状态仍未知'
+Assert-Equal (ConvertFrom-PcBitLockerStatus "Conversion Status: Used Space Only Encrypted`r`nProtection Status: Protection Off (1 reboots left)`r`nPercentage Encrypted: 100.0%`r`n") 'FullyEncrypted' 'B2 暂停保护的剩余重启次数与 CRLF'
+Assert-Equal (ConvertFrom-PcBitLockerStatus "转换状态：已完全加密`r`n保护状态：保护已关闭`r`n已加密百分比：100.0%`r`n") 'FullyEncrypted' 'B2 中文保护已关闭与 CRLF'
+
 
 # P3：数据盘需要内部设备、盘符和真实文件卷；未知 OEM 分区永不成为空闲空间。
 foreach ($bus in @('NVMe', 'SATA', 'SAS', 'ATA', 'SCSI', 'RAID', 'Virtual', 'File Backed Virtual')) {
@@ -398,6 +548,74 @@ Assert-Equal $r.CreatedPartitions[0].Partition.Offset ($p.NewVolumes[0].Offset +
 Assert-Equal $r.FinalLayout[2].Size ($p.NewVolumes[1].Size - 32MB - 8MB) 'P4 最后卷实际值'
 Assert-Equal @($script:sideEffects | Where-Object { $_ -eq 'Format' }).Count 2 '只格式化两个本次新卷'
 
+# B4：完整执行器状态 × 策略 × 聊天确认；任何前置拒绝均无步骤、日志或磁盘写入。
+& {
+    $script:protectorReads = 0
+    $script:protectorAnswer = @{ Known = $true; Types = @('Tpm', 'RecoveryPassword') }
+    function Read-PcRecoveryProtectors { param($Context); $script:protectorReads++; return $script:protectorAnswer }
+    foreach ($policy in @('AllowWithRecoveryKeyConfirmation', 'Block')) {
+        foreach ($stateName in @('Off', 'FullyEncrypted', 'Converting', 'Unknown')) {
+            foreach ($confirmed in @($false, $true)) {
+                $s = New-TestState
+                # 即便原计划没有密钥标志，执行仍以实时状态为准。
+                $p = New-PcPartitionPlan $s
+                Assert-True (-not $p.RequiresRecoveryKeyConfirmation -and $p.RecoveryKeyHint -eq '') 'UX3 Off 计划没有密钥要求'
+                $s.BitLocker = $stateName
+                Reset-TestExecution $s; $script:protectorReads = 0; $phase = @{ StepMayHaveRun = $false }
+                $r = Invoke-PcPartitionExecution $p $s $context -BitLockerPolicy $policy -RecoveryKeyConfirmed:$confirmed -ChildState $phase -Confirm:$false
+                $expected = 'Refused'
+                if ($stateName -eq 'Off') { $expected = 'Done' }
+                if ($stateName -eq 'FullyEncrypted' -and $policy -ne 'Block') {
+                    $expected = 'NeedsRecoveryKeyConfirmation'; if ($confirmed) { $expected = 'Done' }
+                }
+                Assert-Equal $r.Status $expected ('B4 Apply ' + $stateName + '/' + $policy + '/' + $confirmed)
+                if ($expected -ne 'Done') {
+                    Assert-Equal $r.StoppedAt 'Preflight' 'B4 停在前置检查'
+                    Assert-Equal $script:sideEffects.Count 0 'B4 拒绝无副作用'
+                    Assert-Equal $r.Steps.Count 0 'B4 拒绝无步骤'
+                    Assert-True (-not $phase.StepMayHaveRun) 'B4 未进入磁盘步骤'
+                }
+                $readCount = 0; if ($stateName -eq 'FullyEncrypted' -and $confirmed -and $policy -ne 'Block') { $readCount = 1 }
+                Assert-Equal $script:protectorReads $readCount 'B4 仅确认后加密压缩读取保护器'
+            }
+        }
+    }
+    foreach ($answer in @(@{ Known = $true; Types = @('Tpm') }, @{ Known = $true; Types = @() }, @{ Known = $false; Types = @() })) {
+        $s = New-TestState; $s.BitLocker = 'FullyEncrypted'; $p = New-PcPartitionPlan $s
+        Reset-TestExecution $s; $script:protectorAnswer = $answer
+        $r = Invoke-PcPartitionExecution $p $s $context -RecoveryKeyConfirmed -Confirm:$false
+        Assert-Equal $r.Status 'Refused' 'B4 无恢复密码或未知清单拒绝'
+        Assert-Equal $r.StoppedAt 'Preflight' 'B4 保护器拒绝停在前置检查'
+        Assert-Equal $script:sideEffects.Count 0 'B4 保护器拒绝无写入或日志'
+        if ($answer.Known) { Assert-Equal $r.Reason '这台电脑的磁盘加密没有恢复密钥，万一需要时无法解锁，本版本不分区' 'B4 无密钥原因' }
+        else { Assert-True ($r.Reason -match '无法确认.*恢复密钥') 'B4 未知保护器原因' }
+    }
+    # pending 计划解析为加密盘后仍必须确认；解析为 Off 则没有额外步骤。
+    foreach ($live in @('Off', 'FullyEncrypted')) {
+        $s = New-TestState; $s.BitLocker = 'Unknown'; $p = New-PcPartitionPlan $s
+        $s.BitLocker = $live; Reset-TestExecution $s
+        $r = Invoke-PcPartitionExecution $p $s $context -Confirm:$false
+        $expected = 'Done'; if ($live -eq 'FullyEncrypted') { $expected = 'NeedsRecoveryKeyConfirmation' }
+        Assert-Equal $r.Status $expected ('B4 pending -> ' + $live)
+    }
+    foreach ($stateName in @('Off', 'FullyEncrypted', 'Converting', 'Unknown')) {
+        foreach ($policy in @('AllowWithRecoveryKeyConfirmation', 'Block')) {
+            $s = New-TestState; $s.Disks[0].Size += 100GB; $s.BitLocker = $stateName
+            $p = New-PcPartitionPlan $s -BitLockerPolicy $policy; Reset-TestExecution $s; $script:protectorReads = 0
+            $r = Invoke-PcPartitionExecution $p $s $context -BitLockerPolicy $policy -Confirm:$false
+            Assert-Equal $r.Status 'Done' 'B5 Create 执行不依赖加密状态或确认'
+            Assert-Equal $script:protectorReads 0 'B5 Create 不读取保护器'
+            Assert-True ('Resize' -notin $script:sideEffects) 'B5 Create 不压缩 C'
+        }
+    }
+    $s = New-TestState; $s.BitLocker = 'FullyEncrypted'; $p = New-PcPartitionPlan $s
+    Reset-TestExecution $s; $script:protectorReads = 0
+    $r = Invoke-PcPartitionExecution $p $null $context -RecoveryKeyConfirmed -WhatIf
+    Assert-Equal $r.Status 'WhatIf' 'B4 加密压缩 WhatIf 不检查'
+    Assert-Equal $script:protectorReads 0 'B4 WhatIf 不读密钥'
+    Assert-Equal $script:sideEffects.Count 0 'B4 WhatIf 零副作用'
+}
+
 # Auto：完整执行覆盖创建时、回读时、格式化时的自动盘符和实际目录位置。
 foreach ($stage in @('NewPartition', 'ReadBack', 'FormatVolume')) {
     & {
@@ -537,11 +755,172 @@ Assert-Equal $script:sideEffects.Count 0 '其他账户不改磁盘'
     Assert-Equal $r.CreatedPartitions[0].Partition.DiskNumber 1 '只在选定空盘新建'
 }
 
+# B2/B4：真实读取适配器绑定内存假命令；密码只存在于输入，所有输出、结果和审计都不得含密码。
+& {
+    $fakePassword = '111111-222222-333333-444444-555555-666666-777777-888888'
+    $script:bitLockerNative = $null; $script:bitLockerText = ''; $script:bitLockerToolCalls = 0
+    $script:bitLockerToolFailure = $false; $script:bitLockerLogs = @()
+    $queryContext = @{ SystemRoot = 'C:\Windows'; IsAdmin = $true; CurrentUserSid = 'test-sid' }
+    $script:elevatedShellReads = 0
+    function Read-PcShellBitLockerProtection { $script:elevatedShellReads++; return 2 }
+    function Get-BitLockerVolume {
+        [CmdletBinding()]param($MountPoint)
+        Assert-Equal $MountPoint 'C:' 'B2/B4 只读取 C 加密信息'
+        if ($null -eq $script:bitLockerNative) { throw 'Access denied' }
+        return $script:bitLockerNative
+    }
+    function Join-Path { param($Path, $ChildPath); return ('C:\Windows\System32\' + $ChildPath) }
+    function Write-CleanerLog {
+        [CmdletBinding(SupportsShouldProcess = $true)]param($Action, $Path, $Result, $Message, $Context)
+        $script:bitLockerLogs += @{ Action = $Action; Path = $Path; Result = $Result; Message = $Message }
+    }
+    function Invoke-External {
+        [CmdletBinding(SupportsShouldProcess = $true)]param($FilePath, $ArgumentList, $Description, $Context, $OutputEncoding)
+        $script:bitLockerToolCalls++
+        Assert-True ($FilePath -match 'manage-bde.exe$') 'B2/B4 仅 manage-bde 回退'
+        Assert-True ($ArgumentList -join ' ' -in @('-status C:', '-protectors -get C:')) 'B2/B4 查询参数只读'
+        Assert-True ($null -ne $OutputEncoding) 'B2/B4 本地 OEM 编码'
+        if ($ArgumentList[0] -eq '-protectors') {
+            # 模拟共享包装器可能在失败时把密码混入审计 Message。
+            Write-CleanerAudit -Action External -Path $FilePath -Result Started -Message $fakePassword -Context $Context
+            if ($script:bitLockerToolFailure) {
+                Write-CleanerAudit -Action External -Path $FilePath -Result Failed -Message $fakePassword -Context $Context
+                throw $fakePassword
+            }
+            Write-CleanerAudit -Action External -Path $FilePath -Result Success -Message $fakePassword -Context $Context
+        }
+        return @{ StandardOutput = $script:bitLockerText; StandardError = $fakePassword; ExitCode = 0 }
+    }
+    foreach ($case in @(
+        @{ VolumeStatus = 'FullyDecrypted'; ProtectionStatus = 'Off'; EncryptionPercentage = 0; Expected = 'Off' },
+        @{ VolumeStatus = 'FullyEncrypted'; ProtectionStatus = 'On'; EncryptionPercentage = 100; Expected = 'FullyEncrypted' },
+        @{ VolumeStatus = 'FullyEncrypted'; ProtectionStatus = 'Off'; EncryptionPercentage = 100; Expected = 'FullyEncrypted' },
+        @{ VolumeStatus = 'EncryptionInProgress'; ProtectionStatus = 'On'; EncryptionPercentage = 20; Expected = 'Converting' },
+        @{ VolumeStatus = 'DecryptionInProgress'; ProtectionStatus = 'Off'; EncryptionPercentage = 20; Expected = 'Converting' },
+        @{ VolumeStatus = 'EncryptionPaused'; ProtectionStatus = 'Off'; EncryptionPercentage = 0; Expected = 'Converting' },
+        @{ VolumeStatus = 'DecryptionPaused'; ProtectionStatus = 'Off'; EncryptionPercentage = 100; Expected = 'Converting' },
+        @{ VolumeStatus = 'Unknown'; ProtectionStatus = 'Unknown'; EncryptionPercentage = $null; Expected = 'Unknown' }
+    )) {
+        $script:bitLockerNative = $case; $script:bitLockerToolCalls = 0
+        Assert-Equal (Read-PcBitLocker $queryContext) $case.Expected ('B2 原生适配器 ' + $case.VolumeStatus + '/' + $case.ProtectionStatus)
+        if ($case.Expected -ne 'Unknown') { Assert-Equal $script:bitLockerToolCalls 0 'B2 已确定状态不运行回退' }
+    }
+    $script:bitLockerNative = $null
+    foreach ($case in @(
+        @('Conversion Status: Fully Decrypted', 'Protection Status: Protection Off', 'Off'),
+        @('Conversion Status: Fully Encrypted', 'Protection Status: Protection On', 'FullyEncrypted'),
+        @('转换状态：完全加密', '保护状态：保护关闭', 'FullyEncrypted'),
+        @('转换状态：解密已暂停', '保护状态：保护关闭', 'Converting'),
+        @('Access denied', '', 'Unknown')
+    )) {
+        $script:bitLockerText = $case[0] + "`n" + $case[1]; $script:bitLockerToolCalls = 0
+        Assert-Equal (Read-PcBitLocker $queryContext) $case[2] ('B2 manage-bde 适配器 ' + $case[2])
+        Assert-Equal $script:bitLockerToolCalls 1 'B2 读取失败只回退一次'
+    }
+    foreach ($types in @(@('Tpm', 'RecoveryPassword'), @('1', '3'), @('Tpm'), @('Unrecognized'), @())) {
+        $nativeProtectors = @($types | ForEach-Object { @{ KeyProtectorType = $_; RecoveryPassword = $fakePassword; KeyProtectorId = $fakePassword } })
+        $safe = ConvertTo-PcProtectorTypes $nativeProtectors
+        Assert-True ((ConvertTo-Json -InputObject $safe -Depth 8) -notmatch [regex]::Escape($fakePassword)) 'B4 类型提取不泄露对象内密码'
+        if ('RecoveryPassword' -in $types -or '3' -in $types) { Assert-Equal (Get-PcRecoveryProtectorReason $safe) '' 'B4 原生恢复密码类型被识别' }
+        else { Assert-True ([bool](Get-PcRecoveryProtectorReason $safe)) 'B4 没有恢复密码类型拒绝' }
+    }
+    foreach ($native in @(@{ KeyProtector = @() }, [pscustomobject]@{ KeyProtector = @() })) {
+        $script:bitLockerNative = $native; $script:bitLockerToolCalls = 0
+        $safe = Read-PcRecoveryProtectors $queryContext
+        Assert-True $safe.Known 'B4 已知空保护器清单保留为空'
+        Assert-Equal (Get-PcRecoveryProtectorReason $safe) '这台电脑的磁盘加密没有恢复密钥，万一需要时无法解锁，本版本不分区' 'B4 原生空清单没有恢复密钥'
+        Assert-Equal $script:bitLockerToolCalls 0 'B4 已知空清单不回退'
+    }
+    $script:bitLockerNative = @{ KeyProtector = @(@{ KeyProtectorType = 'Tpm' }, @{ KeyProtectorType = 'RecoveryPassword'; RecoveryPassword = $fakePassword }) }
+    $script:bitLockerToolCalls = 0
+    $output = @(Read-PcRecoveryProtectors $queryContext *>&1)
+    Assert-Equal $output.Count 1 'B4 原生适配器只输出安全类型对象'
+    Assert-Equal $script:bitLockerToolCalls 0 'B4 原生保护器可读无需回退'
+    Assert-Equal ($output[0].Types -join ',') 'Tpm,RecoveryPassword' 'B4 原生适配器只返回类型'
+    Assert-True ((ConvertTo-Json -InputObject $output -Depth 8) -notmatch [regex]::Escape($fakePassword)) 'B4 原生适配器全部输出无密码'
+    # 走实际执行器 + 实际读取适配器，核对结果和操作日志均无密码。
+    $s = New-TestState; $s.BitLocker = 'FullyEncrypted'; $p = New-PcPartitionPlan $s; Reset-TestExecution $s
+    function Write-PcPartitionLog { param($Step, $Status, $Message, $Context); $script:bitLockerLogs += @{ Step = $Step; Status = $Status; Message = $Message } }
+    $output = @(Invoke-PcPartitionExecution $p $s $queryContext -RecoveryKeyConfirmed -Confirm:$false *>&1)
+    Assert-Equal $output[-1].Status 'Done' 'B4 有恢复密码执行成功'
+    $objects = @($p) + $output + @($script:bitLockerLogs)
+    Assert-True ((ConvertTo-Json -InputObject $objects -Depth 8) -notmatch [regex]::Escape($fakePassword)) 'B4 方案、执行结果、所有流和日志不含密码'
+    foreach ($case in @(
+        @{ Text = "Key Protectors:`n    TPM:`n      ID: {fake}`n    Numerical Password:`n      ID: {fake}`n      Password:`n        $fakePassword"; Known = $true; HasRecovery = $true },
+        @{ Text = "密钥保护器：`n    TPM：`n      ID：{fake}`n    数字密码：`n      密码：$fakePassword"; Known = $true; HasRecovery = $true },
+        @{ Text = 'TPM:'; Known = $true; HasRecovery = $false },
+        @{ Text = 'None Found.'; Known = $true; HasRecovery = $false },
+        @{ Text = '未找到密钥保护器。'; Known = $true; HasRecovery = $false },
+        @{ Text = $fakePassword; Known = $false; HasRecovery = $false },
+        @{ Text = 'Access denied'; Known = $false; HasRecovery = $false }
+    )) {
+        $script:bitLockerNative = $null; $script:bitLockerText = $case.Text; $script:bitLockerLogs = @(); $script:bitLockerToolCalls = 0
+        $output = @(Read-PcRecoveryProtectors $queryContext *>&1)
+        Assert-Equal $output.Count 1 'B4 回退适配器仅输出类型对象'
+        Assert-Equal $output[0].Known $case.Known 'B4 中英文保护器清单可读性'
+        Assert-Equal ('RecoveryPassword' -in $output[0].Types) $case.HasRecovery 'B4 中英文恢复密码类型'
+        Assert-True ('Passphrase' -notin $output[0].Types) 'B4 不把恢复密码下的 Password 字段当保护器'
+        Assert-Equal $script:bitLockerToolCalls 1 'B4 保护器只回退一次'
+        Assert-True ($script:bitLockerLogs.Count -gt 0) 'B4 验证回退有安全审计'
+        Assert-True ((ConvertTo-Json -InputObject (@($output) + @($script:bitLockerLogs)) -Depth 8) -notmatch [regex]::Escape($fakePassword)) 'B4 工具标准输出、标准错误和审计不泄露密码'
+    }
+    $script:bitLockerToolFailure = $true; $script:bitLockerLogs = @()
+    $output = @(Read-PcRecoveryProtectors $queryContext *>&1)
+    Assert-Equal $output.Count 1 'B4 工具异常不输出异常原文'
+    Assert-True (-not $output[0].Known) 'B4 工具异常成为未知清单'
+    Assert-True ((ConvertTo-Json -InputObject (@($output) + @($script:bitLockerLogs)) -Depth 8) -notmatch [regex]::Escape($fakePassword)) 'B4 失败审计和返回结果也无密码'
+    $script:bitLockerToolCalls = 0
+    $WhatIfPreference = $true
+    Assert-Equal (Read-PcBitLocker $queryContext) 'Unknown' 'B2 WhatIf 不读加密'
+    Assert-True (-not (Read-PcRecoveryProtectors $queryContext).Known) 'B4 WhatIf 不读保护器'
+    Assert-Equal $script:bitLockerToolCalls 0 'B4 WhatIf 不运行工具'
+    Assert-Equal $script:elevatedShellReads 0 'UX3 提权读取失败也不能由 Shell Off 绕过安全检查'
+}
+
 # UAC 参数按字面量编码，路径中的中文、空格、引号不会变为命令。
 $command = New-PcElevationCommand "C:\脚本's\partition.ps1" 'C:\方案 空格.json' 'C:\结果.json' 'test-sid'
 Assert-True ($command.Contains("'C:\脚本''s\partition.ps1'")) '提权脚本路径正确转义'
 Assert-True ($command -match '-Apply -ElevatedChild' -and $command -match '-PlanPath' -and $command -match '-ResultPath' -and $command -match '-OriginalUserSid') '提权传递完整参数'
 Assert-Equal @($ast.FindAll({ param($n) $n -is [Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Start-Process' }, $true)).Count 1 '只有一个提权入口'
+
+# B4：确认开关经主入口、提权编码命令传到子入口，未确认时绝不自动补上。
+& {
+    $script:capturedCommand = ''; $script:childConfirmed = $false; $admin = $false
+    $s = New-TestState; $p = New-PcPartitionPlan $s
+    function Get-CleanerContext { return @{ IsAdmin = $admin; CurrentUserSid = 'test-sid' } }
+    function Get-PcOutputPath { param($Path, $Kind, $Context); return 'memory-confirmation-result.json' }
+    function Write-PcJson { param($Value, $Path) }
+    function Read-PcJson { param($Path); return $p }
+    function Read-PcPartitionState { param($Context); return $s }
+    function Start-PcElevatedApply { param($Command); $script:capturedCommand = $Command; return 12 }
+    function Test-Path { param($LiteralPath, $PathType); return $false }
+    foreach ($confirmed in @($false, $true)) {
+        $null = @(Invoke-PcPartitionMain -ScriptPath 'Invoke-TestConfirmedChild' -Planning $false -InputPath 'plan.json' -RecoveryKeyConfirmed:$confirmed)
+        Assert-Equal ($script:capturedCommand -match ' -RecoveryKeyConfirmed(?: |$)') $confirmed 'B4 主入口如实转发确认开关'
+        $arguments = @(Get-PcElevationArguments $script:capturedCommand)
+        $decoded = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($arguments[-1]))
+        $decoded = $decoded.Replace('[Security.Principal.WindowsIdentity]::GetCurrent().User.Value', "'test-sid'") -replace '\bexit (0|12|13|21)\b', 'return $1'
+        function Invoke-TestConfirmedChild {
+            [CmdletBinding(SupportsShouldProcess = $true)]
+            param([switch]$Apply, [switch]$ElevatedChild, $PlanPath, $ResultPath, $OriginalUserSid, $ChildState, [switch]$RecoveryKeyConfirmed)
+            $script:childConfirmed = [bool]$RecoveryKeyConfirmed
+        }
+        Assert-Equal (& ([scriptblock]::Create($decoded))) 0 'B4 假提权子入口正常运行'
+        Assert-Equal $script:childConfirmed $confirmed 'B4 子入口收到准确确认开关'
+    }
+    $admin = $true
+    function Invoke-PcPartitionExecution {
+        [CmdletBinding(SupportsShouldProcess = $true)]param($PlanObject, $State, $Context, $BitLockerPolicy, $ChildState, [switch]$RecoveryKeyConfirmed)
+        $script:childConfirmed = [bool]$RecoveryKeyConfirmed
+        return @{ Reason = ''; Status = 'Done' }
+    }
+    foreach ($child in @($false, $true)) {
+        foreach ($confirmed in @($false, $true)) {
+            $null = @(Invoke-PcPartitionMain -ScriptPath 'fake.ps1' -Planning $false -InputPath 'plan.json' -Child $child -RecoveryKeyConfirmed:$confirmed)
+            Assert-Equal $script:childConfirmed $confirmed 'B4 已提权主入口向执行器转发确认'
+        }
+    }
+}
 
 # 主入口 WhatIf 也必须完全跳过上下文、外部程序、提权、报告及日志写入。
 function Read-PcJson { param($Path); return $p }
@@ -550,7 +929,7 @@ function Read-PcPartitionState { throw 'WhatIf 不得运行存储和加密查询
 function Start-PcElevatedApply { throw 'WhatIf 不得提权' }
 function Write-PcJson { throw 'WhatIf 不得写文件' }
 $script:sideEffects = @()
-$output = @(Invoke-PcPartitionMain -ScriptPath 'fake.ps1' -Planning $false -InputPath 'fake-plan.json' -DryRun $true -BlockEncrypted $true)
+$output = @(Invoke-PcPartitionMain -ScriptPath 'fake.ps1' -Planning $false -InputPath 'fake-plan.json' -DryRun $true -BitLockerPolicy 'Block')
 Assert-Equal $script:sideEffects.Count 0 '主入口 WhatIf 零副作用'
 Assert-True (($output -join '') -match 'RESULT: .*fake-plan.json') '演练只引用已有输入方案'
 
@@ -629,13 +1008,13 @@ Assert-True (($output -join '') -match 'RESULT: .*fake-plan.json') '演练只引
     function Write-PcJson { param($Value, $Path); $script:readFailureWrites += $Value }
     foreach ($denied in @('Disk', 'Partitions', 'Letters', 'SecondPartitions')) {
         $script:nativeDeny = $denied; $script:readFailureWrites = @()
-        $output = @(Invoke-PcPartitionMain -ScriptPath 'fake.ps1' -Planning $true -InputPath 'plan.json' -BlockEncrypted $true)
+        $output = @(Invoke-PcPartitionMain -ScriptPath 'fake.ps1' -Planning $true -InputPath 'plan.json' -BitLockerPolicy 'Block')
         $unavailable = $script:readFailureWrites[0]
         Assert-Equal $unavailable.Situation 'Unknown' ('R3a 实际读取失败 -> Unknown ' + $denied)
         Assert-True (-not $unavailable.Feasible -and $unavailable.NeedsElevatedRead) ('R3a 实际权限失败标记 ' + $denied)
         Assert-True (($output -join '') -match 'RESULT: memory-read-result.json') ('R3a 实际读取失败仍输出 RESULT ' + $denied)
         $script:readFailureWrites = @()
-        $output = @(Invoke-PcPartitionMain -ScriptPath 'fake.ps1' -Planning $false -InputPath 'plan.json' -Child $true -BlockEncrypted $true)
+        $output = @(Invoke-PcPartitionMain -ScriptPath 'fake.ps1' -Planning $false -InputPath 'plan.json' -Child $true -BitLockerPolicy 'Block')
         Assert-Equal $script:readFailureWrites[0].Status 'Refused' ('R3b 实际读取失败仍写子结果 ' + $denied)
         Assert-Equal $script:readFailureWrites[0].StoppedAt 'Preflight' ('R3b 实际读取失败无磁盘步骤 ' + $denied)
     }
@@ -654,16 +1033,16 @@ Assert-True (($output -join '') -match 'RESULT: .*fake-plan.json') '演练只引
         if ($script:launchMode -eq 'Cancel') { throw '模拟用户取消 UAC' }
         return 13
     }
-    $null = @(Invoke-PcPartitionMain -ScriptPath 'fake.ps1' -Planning $true -InputPath 'plan.json' -BlockEncrypted $true)
+    $null = @(Invoke-PcPartitionMain -ScriptPath 'fake.ps1' -Planning $true -InputPath 'plan.json' -BitLockerPolicy 'Block')
     Assert-Equal $script:launches 0 'Plan 普通权限不请求 UAC'
     Assert-True $script:mainWrites[0].Feasible '普通权限主入口保存可行方案'
     $script:mainWrites = @()
-    $null = @(Invoke-PcPartitionMain -ScriptPath 'fake.ps1' -Planning $false -InputPath 'plan.json' -BlockEncrypted $true)
+    $null = @(Invoke-PcPartitionMain -ScriptPath 'fake.ps1' -Planning $false -InputPath 'plan.json' -BitLockerPolicy 'Block')
     Assert-Equal $script:launches 1 '取消 UAC 不重试'
     Assert-Equal $script:mainWrites[0].Status 'Skipped' '取消 UAC 报跳过'
     Assert-True ($script:mainWrites[0].Reason -match '没有获得管理员权限') '取消 UAC 中文原因'
     $script:launches = 0; $script:mainWrites = @(); $script:launchMode = 'OtherAccount'
-    $null = @(Invoke-PcPartitionMain -ScriptPath 'fake.ps1' -Planning $false -InputPath 'plan.json' -BlockEncrypted $true)
+    $null = @(Invoke-PcPartitionMain -ScriptPath 'fake.ps1' -Planning $false -InputPath 'plan.json' -BitLockerPolicy 'Block')
     Assert-Equal $script:launches 1 '更换账户只请求一次 UAC'
     Assert-Equal $script:mainWrites[0].Status 'Skipped' '更换账户报跳过'
     Assert-True ($script:mainWrites[0].Reason -match '另一个账户') '即使子进程不能写原目录仍报告账户变化'
@@ -853,7 +1232,7 @@ foreach ($read in @('DiskKind', 'BitLocker', 'MaxShrink')) {
     }
     function Read-PcPartitionState { param($Context); if ($mode -eq 'Live') { throw 'Access is denied' }; return $state }
     function Invoke-PcPartitionExecution {
-        [CmdletBinding(SupportsShouldProcess = $true)]param($PlanObject, $State, $Context, $BlockEncrypted, $ChildState)
+        [CmdletBinding(SupportsShouldProcess = $true)]param($PlanObject, $State, $Context, $BitLockerPolicy, $ChildState, [switch]$RecoveryKeyConfirmed)
         $script:failureExecCalls++
         if ($mode -eq 'Incomplete') { throw 'Missing property' }
         if ($mode -eq 'AfterStep') { $ChildState.StepMayHaveRun = $true; throw 'Unexpected error after step' }
@@ -864,7 +1243,7 @@ foreach ($read in @('DiskKind', 'BitLocker', 'MaxShrink')) {
     foreach ($child in @($false, $true)) {
         foreach ($failure in @('Missing', 'Unreadable', 'Malformed', 'Incomplete', 'Live', 'Context')) {
             $mode = $failure; $script:failureWrites = @(); $script:failureExecCalls = 0; $script:failureReads = 0
-            $output = @(Invoke-PcPartitionMain -ScriptPath 'fake.ps1' -Planning $false -InputPath 'plan.json' -OutputPath 'child-result.json' -Child $child -BlockEncrypted $true)
+            $output = @(Invoke-PcPartitionMain -ScriptPath 'fake.ps1' -Planning $false -InputPath 'plan.json' -OutputPath 'child-result.json' -Child $child -BitLockerPolicy 'Block')
             Assert-Equal $script:failureWrites.Count 1 ('R3b 每次失败保存唯一结果 ' + $child + '/' + $failure)
             $r = $script:failureWrites[0]
             Assert-Equal $r.Schema 'pc-care/partition/1' 'R3b 结果契约'
@@ -876,7 +1255,7 @@ foreach ($read in @('DiskKind', 'BitLocker', 'MaxShrink')) {
         }
     }
     $mode = 'Live'; $script:failureWrites = @()
-    $output = @(Invoke-PcPartitionMain -ScriptPath 'fake.ps1' -Planning $true -InputPath 'plan.json' -BlockEncrypted $true)
+    $output = @(Invoke-PcPartitionMain -ScriptPath 'fake.ps1' -Planning $true -InputPath 'plan.json' -BitLockerPolicy 'Block')
     $r = $script:failureWrites[0]
     Assert-Equal $r.Schema 'pc-care/partition-plan/1' 'R3a 布局读取失败仍保存方案'
     Assert-Equal $r.Situation 'Unknown' 'R3a 不把未知布局误报为空闲'
@@ -886,13 +1265,13 @@ foreach ($read in @('DiskKind', 'BitLocker', 'MaxShrink')) {
     Assert-Equal @($r.NewVolumes).Count 0 'R3a 不虚构新分区'
     Assert-True (($output -join '') -match 'RESULT: memory-result.json') 'R3a 失败方案照常输出 RESULT'
     $mode = 'AfterStep'; $script:failureWrites = @()
-    $null = @(Invoke-PcPartitionMain -ScriptPath 'fake.ps1' -Planning $false -InputPath 'plan.json' -BlockEncrypted $true)
+    $null = @(Invoke-PcPartitionMain -ScriptPath 'fake.ps1' -Planning $false -InputPath 'plan.json' -BitLockerPolicy 'Block')
     Assert-Equal $script:failureWrites[0].Status 'Failed' 'R1 步骤后意外异常不能误报前置拒绝'
     Assert-True ($script:failureWrites[0].Reason -notmatch '未修改任何分区' -and $script:failureWrites[0].Reason -match '不要重复执行') 'R1 步骤后异常保留布局检查提示'
     $admin = $false; $mode = ''
     foreach ($code in @(0, 1, 12, 13, 21)) {
         $exitCode = $code; $script:failureWrites = @()
-        $output = @(Invoke-PcPartitionMain -ScriptPath 'fake.ps1' -Planning $false -InputPath 'plan.json' -BlockEncrypted $true)
+        $output = @(Invoke-PcPartitionMain -ScriptPath 'fake.ps1' -Planning $false -InputPath 'plan.json' -BitLockerPolicy 'Block')
         $r = $script:failureWrites[0]
         Assert-True (($output -join '') -match 'RESULT: memory-result.json') ('R1 缺失结果仍输出 RESULT ' + $code)
         if ($code -notin @(0, 13)) { Assert-True ($r.Reason -match '管理员窗口没有正常运行') ('R1 非零退出中文解释 ' + $code) }
@@ -908,4 +1287,4 @@ foreach ($read in @('DiskKind', 'BitLocker', 'MaxShrink')) {
         else { Assert-True ($r.Reason -match '先检查磁盘状态.*不要重复执行' -and $r.Reason -notmatch '未修改任何分区') 'R1 可能修改时保留检查布局提示' }
     }
 }
-Write-Host ("PASS t7-partition: {0} assertions; P1/P2/P3/P4; R1/R2/R3a/R3b; Auto; AST-only loading; fake storage; no script body executed." -f $script:assertions)
+Write-Host ("PASS t7-partition: {0} assertions; P1/P2/P3/P4; R1/R2/R3a/R3b; B1/B2/B3/B4/B5; UX1/UX2/UX3/UX4; Auto; AST-only loading; fake storage; no script body executed." -f $script:assertions)
