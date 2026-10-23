@@ -216,17 +216,22 @@ foreach ($policy in @('AllowWithRecoveryKeyConfirmation', 'Block')) {
         $planObject = New-PcPartitionPlan $state -BitLockerPolicy $policy
         $feasible = $stateName -in @('Off', 'Unknown') -or ($stateName -eq 'FullyEncrypted' -and $policy -ne 'Block')
         Assert-Equal $planObject.Feasible $feasible ('B2 Plan ' + $stateName + '/' + $policy)
-        Assert-Equal $planObject.RequiresRecoveryKeyConfirmation ($stateName -ne 'Off') ('B3 找回密钥标志 ' + $stateName + '/' + $policy)
+        Assert-Equal $planObject.RequiresRecoveryKeyConfirmation ($stateName -in @('FullyEncrypted', 'Unknown')) ('B3/UX2 找回密钥标志 ' + $stateName + '/' + $policy)
+        Assert-Equal ([bool]$planObject.RecoveryKeyHint) $planObject.RequiresRecoveryKeyConfirmation ('UX4 仅需确认时提供提示 ' + $stateName)
         Assert-Equal ($planObject.PendingChecks.Count -gt 0) ($stateName -eq 'Unknown') ('B2 未知待检查 ' + $stateName + '/' + $policy)
         $frozen = New-PcPartitionPlan (New-TestState)
         $valid = $stateName -eq 'Off' -or ($stateName -eq 'FullyEncrypted' -and $policy -ne 'Block')
         Assert-Equal (Test-PcFrozenPlan $frozen $state -BitLockerPolicy $policy).Valid $valid ('B2 Apply 实时状态 ' + $stateName + '/' + $policy)
-        if ($stateName -ne 'Off') {
-            foreach ($fragment in @('https://aka.ms/myrecoverykey', '打印件', 'U 盘', '保存的文件', 'AI 必须先在聊天中')) {
-                Assert-True (($planObject.Warnings -join '') -match [regex]::Escape($fragment)) ('B3 明确找回密钥位置 ' + $fragment)
+        if ($stateName -eq 'FullyEncrypted') {
+            foreach ($fragment in @('https://aka.ms/myrecoverykey', '打印件', 'U 盘', '保存的文件', '先在聊天中确认')) {
+                Assert-True ($planObject.RecoveryKeyHint -match [regex]::Escape($fragment)) ('B3 明确找回密钥位置 ' + $fragment)
             }
         }
+        elseif ($stateName -eq 'Unknown') {
+            Assert-Equal $planObject.RecoveryKeyHint '未能读取 C 盘的加密状态；如果你知道 C 盘已加密，请先确认能找到恢复密钥。' 'UX2 未知时只向知道已加密的用户请求确认'
+        }
         else { Assert-True (($planObject.Warnings -join '') -notmatch '恢复密钥') 'B3 未加密不加密钥步骤' }
+        if ($planObject.RequiresRecoveryKeyConfirmation) { Assert-True ($planObject.RecoveryKeyHint -cin $planObject.Warnings) 'UX4 代理可以逐字转述同一提示' }
         if ($stateName -eq 'Converting') { Assert-True (($planObject.Blockers -join '') -match 'C 盘正在加密或解密，完成后才能分区') 'B2 转换中说明原因' }
         foreach ($createKind in @('Unallocated', 'EmptyDisk')) {
             if ($createKind -eq 'Unallocated') { $state.Disks[0].Size += 100GB }
@@ -234,10 +239,89 @@ foreach ($policy in @('AllowWithRecoveryKeyConfirmation', 'Block')) {
             $create = New-PcPartitionPlan $state -BitLockerPolicy $policy
             Assert-Equal $create.Mode 'Create' ('B5 创建模式 ' + $createKind)
             Assert-True ($create.Feasible -and -not $create.RequiresRecoveryKeyConfirmation) ('B5 创建不需密钥 ' + $stateName + '/' + $policy)
+            Assert-Equal $create.RecoveryKeyHint '' 'UX4 创建模式没有密钥提示'
             Assert-True (Test-PcFrozenPlan $create $state -BitLockerPolicy $policy).Valid ('B5 创建无需加密检查 ' + $createKind)
             Assert-True (($create.Warnings -join '') -notmatch '恢复密钥') 'B5 创建不提示密钥'
         }
     }
+}
+
+# UX1/UX2/UX4：纯映射 + 真正的 Shell 包装器绑定内存 COM 假对象，再生成 Plan。
+& {
+    $script:shellValue = $null; $script:shellFailure = ''; $script:shellCalls = 0; $script:adminReads = 0
+    $item = [pscustomobject]@{}
+    $item | Add-Member ScriptMethod ExtendedProperty {
+        param($Name)
+        Assert-Equal $Name 'System.Volume.BitLockerProtection' 'UX1 只读取 Shell 加密属性'
+        if ($script:shellFailure -eq 'Property') { throw 'Property unavailable' }
+        return ,$script:shellValue
+    }
+    $folder = [pscustomobject]@{ Self = $item }
+    $shell = [pscustomobject]@{ Folder = $folder }
+    $shell | Add-Member ScriptMethod NameSpace {
+        param($Path)
+        Assert-Equal $Path 'C:' 'UX1 Shell 只读取 C 盘'
+        if ($script:shellFailure -eq 'Namespace') { throw 'Namespace unavailable' }
+        if ($script:shellFailure -eq 'MissingFolder') { return $null }
+        return $this.Folder
+    }
+    $script:fakeShell = $shell
+    function New-Object {
+        [CmdletBinding()]param([string]$ComObject)
+        $script:shellCalls++
+        Assert-Equal $ComObject 'Shell.Application' 'UX1 创建 Windows Shell'
+        if ($script:shellFailure -eq 'Create') { throw 'COM unavailable' }
+        return $script:fakeShell
+    }
+    function Get-BitLockerVolume { $script:adminReads++; throw '不得调用管理员接口' }
+    function Invoke-External { $script:adminReads++; throw '不得运行管理员工具' }
+    $queryContext = @{ IsAdmin = $false }
+    foreach ($case in @(
+        @{ Value = 0; Expected = 'Unknown' },
+        @{ Value = 1; Expected = 'FullyEncrypted' },
+        @{ Value = 2; Expected = 'Off' },
+        @{ Value = 3; Expected = 'Converting' },
+        @{ Value = 4; Expected = 'Converting' },
+        @{ Value = 5; Expected = 'FullyEncrypted' },
+        @{ Value = 6; Expected = 'Unknown' },
+        @{ Value = $null; Expected = 'Unknown' },
+        @{ Value = -1; Expected = 'Unknown' },
+        @{ Value = 99; Expected = 'Unknown' },
+        @{ Value = 'unexpected'; Expected = 'Unknown' },
+        @{ Value = '2'; Expected = 'Unknown' },
+        @{ Value = $true; Expected = 'Unknown' },
+        @{ Value = 2.1; Expected = 'Unknown' },
+        @{ Value = @(2); Expected = 'Unknown' },
+        @{ Value = [pscustomobject]@{ Value = 2 }; Expected = 'Unknown' }
+    )) {
+        Assert-Equal (ConvertFrom-PcShellBitLockerProtection $case.Value) $case.Expected ('UX1 映射 ' + [string]$case.Value)
+        $script:shellValue = $case.Value
+        $state = New-TestState; $state.BitLocker = Read-PcBitLocker $queryContext
+        Assert-Equal $state.BitLocker $case.Expected ('UX1 普通权限 Shell 读取 ' + [string]$case.Value)
+        $planObject = New-PcPartitionPlan $state
+        Assert-Equal $planObject.RequiresRecoveryKeyConfirmation ($case.Expected -in @('FullyEncrypted', 'Unknown')) 'UX2 Shell 规划确认标记'
+        Assert-Equal $planObject.Feasible ($case.Expected -ne 'Converting') 'UX1 转换中仍阻止分区'
+        Assert-Equal ([bool]$planObject.RecoveryKeyHint) $planObject.RequiresRecoveryKeyConfirmation 'UX4 Shell 规划提示'
+        if ($case.Expected -eq 'Off') { Assert-True (($planObject.Warnings -join '') -notmatch '恢复密钥') 'UX2 Shell Off 不产生密钥警告' }
+        if ($case.Expected -eq 'Unknown') { Assert-True ($planObject.RecoveryKeyHint -match '未能读取.*如果你知道 C 盘已加密') 'UX2 Shell Unknown 条件式提示' }
+    }
+    foreach ($value in @([byte]2, [sbyte]2, [int16]2, [uint16]2, [uint32]2, [int64]2, [uint64]2)) {
+        Assert-Equal (ConvertFrom-PcShellBitLockerProtection $value) 'Off' 'UX1 不同整数类型枚举'
+    }
+    foreach ($failure in @('Create', 'Namespace', 'MissingFolder', 'Property')) {
+        $script:shellFailure = $failure
+        $output = @(Read-PcBitLocker $queryContext *>&1)
+        Assert-Equal $output.Count 1 ('UX1 包装器失败不泄露异常 ' + $failure)
+        Assert-Equal $output[0] 'Unknown' ('UX1 包装器失败保留未知 ' + $failure)
+        $state = New-TestState; $state.BitLocker = $output[0]
+        $planObject = New-PcPartitionPlan $state
+        Assert-True ($planObject.Feasible -and $planObject.RequiresRecoveryKeyConfirmation) 'UX2 包装器失败仍能生成待检查方案'
+    }
+    Assert-Equal $script:adminReads 0 'UX1 普通权限从不尝试管理员接口或工具'
+    $callsBefore = $script:shellCalls; $WhatIfPreference = $true
+    Assert-Equal (Read-PcBitLocker $queryContext) 'Unknown' 'UX1 WhatIf 不读取 Shell'
+    Assert-Equal (Read-PcShellBitLockerProtection) $null 'UX1 Shell 包装器也遵守 WhatIf'
+    Assert-Equal $script:shellCalls $callsBefore 'UX1 WhatIf 没有创建 COM'
 }
 
 # B2：两种语言的完成、暂停保护、转换和转换暂停；百分比不能覆盖正在转换的状态。
@@ -474,7 +558,9 @@ Assert-Equal @($script:sideEffects | Where-Object { $_ -eq 'Format' }).Count 2 '
             foreach ($confirmed in @($false, $true)) {
                 $s = New-TestState
                 # 即便原计划没有密钥标志，执行仍以实时状态为准。
-                $p = New-PcPartitionPlan $s; $p.RequiresRecoveryKeyConfirmation = $false; $s.BitLocker = $stateName
+                $p = New-PcPartitionPlan $s
+                Assert-True (-not $p.RequiresRecoveryKeyConfirmation -and $p.RecoveryKeyHint -eq '') 'UX3 Off 计划没有密钥要求'
+                $s.BitLocker = $stateName
                 Reset-TestExecution $s; $script:protectorReads = 0; $phase = @{ StepMayHaveRun = $false }
                 $r = Invoke-PcPartitionExecution $p $s $context -BitLockerPolicy $policy -RecoveryKeyConfirmed:$confirmed -ChildState $phase -Confirm:$false
                 $expected = 'Refused'
@@ -675,6 +761,8 @@ Assert-Equal $script:sideEffects.Count 0 '其他账户不改磁盘'
     $script:bitLockerNative = $null; $script:bitLockerText = ''; $script:bitLockerToolCalls = 0
     $script:bitLockerToolFailure = $false; $script:bitLockerLogs = @()
     $queryContext = @{ SystemRoot = 'C:\Windows'; IsAdmin = $true; CurrentUserSid = 'test-sid' }
+    $script:elevatedShellReads = 0
+    function Read-PcShellBitLockerProtection { $script:elevatedShellReads++; return 2 }
     function Get-BitLockerVolume {
         [CmdletBinding()]param($MountPoint)
         Assert-Equal $MountPoint 'C:' 'B2/B4 只读取 C 加密信息'
@@ -786,6 +874,7 @@ Assert-Equal $script:sideEffects.Count 0 '其他账户不改磁盘'
     Assert-Equal (Read-PcBitLocker $queryContext) 'Unknown' 'B2 WhatIf 不读加密'
     Assert-True (-not (Read-PcRecoveryProtectors $queryContext).Known) 'B4 WhatIf 不读保护器'
     Assert-Equal $script:bitLockerToolCalls 0 'B4 WhatIf 不运行工具'
+    Assert-Equal $script:elevatedShellReads 0 'UX3 提权读取失败也不能由 Shell Off 绕过安全检查'
 }
 
 # UAC 参数按字面量编码，路径中的中文、空格、引号不会变为命令。
@@ -1198,4 +1287,4 @@ foreach ($read in @('DiskKind', 'BitLocker', 'MaxShrink')) {
         else { Assert-True ($r.Reason -match '先检查磁盘状态.*不要重复执行' -and $r.Reason -notmatch '未修改任何分区') 'R1 可能修改时保留检查布局提示' }
     }
 }
-Write-Host ("PASS t7-partition: {0} assertions; P1/P2/P3/P4; R1/R2/R3a/R3b; B1/B2/B3/B4/B5; Auto; AST-only loading; fake storage; no script body executed." -f $script:assertions)
+Write-Host ("PASS t7-partition: {0} assertions; P1/P2/P3/P4; R1/R2/R3a/R3b; B1/B2/B3/B4/B5; UX1/UX2/UX3/UX4; Auto; AST-only loading; fake storage; no script body executed." -f $script:assertions)
