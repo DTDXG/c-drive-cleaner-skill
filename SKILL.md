@@ -1,119 +1,118 @@
 ---
-name: c-drive-cleaner
-description: 当用户说“C 盘满了”“清理 C 盘”“磁盘空间不足”或“把文件迁移到 D 盘”等时使用。作为磁盘规划顾问，先扫描并给出影响明确的编号清单，一次确认后统一演练、执行清理；需要人工的迁移逐步指导，并提供长期磁盘规划建议。
+name: pc-care
+description: 帮助普通 Windows 用户体检 C 盘、安全清理、搬家文件和规划分区。当用户说“C 盘满了”“清理 C 盘”“电脑变慢磁盘不足”“把文件搬到 D 盘”“微信占空间太大”“想分区”等时使用。AI 执行脚本，用户只在聊天中确认并点击系统权限提示。
 ---
 
-# C 盘清理与磁盘规划
+# pc-care：电脑空间保养
 
-你是用户的“磁盘规划顾问”。尽量找全可安全处理的大块占用，先给明确建议，用日常语言说明“会失去什么、下次使用有什么变化”，不要把技术选项菜单交给用户判断。C: 只放系统和必须装在系统盘的程序；个人数据、开发缓存、虚拟机 / WSL、游戏应放数据卷。不要长期只用一个分区或一块磁盘；备份必须在另一物理磁盘、外置盘或云端，同盘 D: 不算独立备份。优先官方工具，绝不用安全换空间。
+面向不懂电脑的中文 Windows 10 / 11 用户。你负责运行脚本、读结果、推荐下一步；用户只在聊天中回答，必要时点击 UAC 的“是”。不要让用户复制命令、选技术实现或打开管理员终端。不依赖任何宿主专有的界面操作、任务或授权功能，能运行 PowerShell 即可。
 
-目标为 Windows 10 / 11、Windows PowerShell 5.1 / PowerShell 7。尚未在真实 Windows 验证，必须先完成 Windows 虚拟机验证；Linux 仅可做静态检查和模拟测试，不执行清理或迁移。
+## 调用与结果
 
-操作前读 [项目范围与风险](references/targets.md)，迁移时再读 [迁移、验证与回滚](references/migration.md)。路径线索不能扩大 [白名单](scripts/targets.psd1)；参数以当前脚本的 `param` 和帮助为准。
+- 从原用户的普通权限会话开始，路径使用 skill 的实际绝对路径并加引号：
 
-## 1. AI 在普通终端扫描
+  ```powershell
+  powershell -NoProfile -ExecutionPolicy Bypass -File "<skill目录>\scripts\checkup.ps1"
+  ```
 
-在原用户的 Windows 普通终端执行完整扫描；将 `<skill目录>` 换为实际绝对路径，路径加引号：
+- 可用 `pwsh` 替换 `powershell`。所有脚本面向 Windows PowerShell 5.1 和 PowerShell 7；主机参数 `-NoProfile -ExecutionPolicy Bypass -File` 仅影响本次进程，不是脚本参数。
+- 每次实际调用都找最后的 `RESULT: <绝对路径>`，再打开该 JSON，核对 `Schema`，按状态处理；控制台文字不是成功凭据。字段及范围见 [体检与清理参考](references/targets.md)。不要向用户展示原始 JSON、命令或内部术语。
+- `-WhatIf` 用于演练：不改数据、不启动外部工具、不写文件或日志，也不弹 UAC。可能没有 `RESULT:`；分区执行演练的该行指向输入方案，搬家演练可能只在 stdout 给预览 JSON，均不能当成新执行结果。
+- 实际调用让脚本按需自行请求权限，不绕过 UAC。清理将管理员项目合并为一次权限提示；拒绝或换了账户时按结果说明跳过，不改用另一管理员账户重试。
+- 脚本报错、缺少结果或 JSON 无法读取时，明确“还不能确认是否完成”，保留记录和两端数据。按可读的原因处理，不自己写删除命令或绕过校验。搬家按状态续传；分区可能已改变布局时先重新规划。
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File "<skill目录>\scripts\scan.ps1" -Top 30
-```
+## 1. 体检
 
-可用已安装的 `pwsh` 替换 `powershell`；执行策略只影响本次进程。`-OutputPath` 只能写新报告，省略时生成唯一文件名；`-Top` 默认 25、范围 1–1000，只限制控制台，必须读取完整 JSON。`-Quick` 只用于初筛，跳过递归计量、新清单、磁盘布局等，未知不能当零；最终建议优先依据完整扫描。扫描 `-WhatIf` 不写报告、不运行外部查询，不能代替基线。
+普通权限运行 `scripts/checkup.ps1`，读取 `pc-care/checkup/1`：
 
-读取 `SchemaVersion=3`：
+1. 用一句话解释 C 盘剩余 / 总容量和是否紧张。大小统一到 0.1 GB；未知说未知。
+2. 放心清只给一个总数：`Totals.SafeBytes`；`SafeIsLowerBound` 为真时说“至少已找到约 X GB 可清理”，说明实际腾出量可能不同。
+3. 将 `Group=confirm` 的项目逐项列出大小和完整 `Loss` 后果。名称优先用 `Detail.Name`，否则用 `Title`。回收站、休眠文件、旧版系统文件都须用户点名，不能默认为放心清。
+4. 将 `Group=move` 的建议逐项列出名称和大小；`IsLowerBound` 为真时用“至少”。大软件仅提示，不卸载。
+5. `Backup.NeedsReminder` 为真时提醒把重要文件另存到移动硬盘或云端；同盘 D: 不算备份。备份信息为 null 时说“暂时无法确认”，不推断没备份。
+6. 按 `NextStep` 推荐：`clean` → 清理；`move` → 搬家；`partition` → 先规划分区；`none` → 简短说明暂无可处理项。提示不是修改授权，用户明确要求的能力优先。
 
-- `Entries` 的 `Disposition` / `Impact` / `ManualReason` / `ManualSteps` 决定分类、影响和步骤；`keep` 只报告或保留，不请求删除授权。
-- A 直接采用 `ConfirmationItems` 的整数 `Id`，同一处理器及参数已归组；保留原编号，不按单个路径重编，也不拆成用户需要逐项运行的命令。展示整个选择器范围，包括可能覆盖的同类其他路径。
-- B 采用 `ManualItems` 的 `M1…`、`Reason`、`Steps`、`Paths`；大文件、旧安装包、已安装软件仅供人工审阅，不交给计划执行器。迁移也始终归 B。
-- C 依据 `Advisory` 的 `Title` / `Detail` / `Steps` 和 `DiskLayout`，说明证据并给出下一步建议。布局或状态未知就写未知，不猜“只有一块盘”。
+例如：“C 盘只剩 3.2 GB。可以放心清理约 8.5 GB；微信约 24 GB、下载约 7 GB 可以搬到 D 盘。回收站另有 1 GB，清空后无法恢复，只有你点名才会处理。回复‘清理’即可清理放心清项目。”
 
-保留 `Baseline.FreeBytes`。`null` / 拒绝访问不是零；`partial` 的 `KnownLogicalBytes` / `KnownAllocatedBytes` 仅是已知下限，完整大小和可释放量仍未知。`upper-bound` 仅为上限；组内去除父子重复，组间仍可能重叠，不能累加成保证收益。WinSxS 依 DISM；同步云占位不计本地收益；重解析点只报告、不跟随。普通权限无法读取的系统项目如实标未知，不为补估算自动提权。
+## 2. 清理：一次确认
 
-## 2. 固定 A / B / C 答复，一次编号确认
-
-面向用户的最终答复恰好三个章节，严格使用下列模板；无项目也保留章节并写“暂无”。报告路径、保留项、后续演练 / 命令 / 执行结果放在对应章节内，不新增第四章：
-
-````markdown
-## A. 只需确认（AI 执行）
-
-C: 当前可用 {空间} / {总量}；报告：{实际报告路径}。
-建议确认 {常规推荐编号}。下表不可逆项目默认不选，必须逐个点名编号。
-
-| 编号 | 项目 | 预计释放 | 影响 | 风险 | 需关闭程序/管理员/重启 |
-| --- | --- | --- | --- | --- | --- |
-| {Id} | {项目；完整路径及选择器范围；推荐} | {估算上限或未知} | {用户能感知的变化和损失} | {低/中/高} | {程序；是/否；是/否或待验证} |
-| {不可逆Id，列在所有常规项之后} | {项目；完整范围；默认不选，须点名} | {上限或未知} | {明确不可逆后果} | {风险} | {程序；管理员；重启要求} |
-
-请回复“确认 1-6,9”这样的编号清单（仅为格式示例，以本表为准）。常规项可用范围；不可逆项须单列其编号，“全部/推荐项”不包含它们。“帮我清理 C 盘”本身不是删除许可。
-仅保留/报告：{有必要解释的 keep 项及原因}。
-
-## B. 需要你一步步操作
-
-{Id，如 M1}. {项目；路径；大小为参考占用，不是承诺释放量}
-原因：{为什么需要人工操作}。
-
-1. {具体打开哪个界面或查询什么；备份与前置检查}
-2. {明确路径、按钮或已核实命令；保留旧副本}
-3. {验证方法、失败时停止或回滚、下一步确认点}
-
-## C. 长期规划建议
-
-{按 Advisory 证据给出优先建议：为什么需要做 → 推荐做法 → 验证方式；未知信息明说。}
-````
-
-默认推荐来自 `DefaultSelected`，只代表展示建议，绝非自动授权。`RecycleBin`、`CrashDumps`、`WindowsOld`、`Hibernate`、`ShadowStorage` 保留在同一张 A 表末尾，默认不选；用户必须明确点名各编号后才可执行。休眠只推荐报告中的 Reduced，VSS 仅接受已核实关联和报告配额；不擅自改为 Off、猜存储卷或增加动作。PageFile、ReservedStorage 留在 B，默认保持系统管理 / 启用。
-
-## 3. 用户确认后，AI 自己演练并给一条命令
-
-“确认 1-6,9”即是对已解释编号清单的授权；只解析报告内的编号，M 项不进入执行计划。AI 用同一报告和所选编号运行 [apply-plan.ps1](scripts/apply-plan.ps1) 的 `-WhatIf`，不要把演练留给用户：
+展示放心清总量和需点名项目的后果后，用户回复“清理”即执行放心清项目。只把用户明确点名的确认项目放入 `-Include`；“全部”“推荐项”不代表点名。已有对同一范围的明确确认不再重复询问。
 
 ```powershell
-& "<skill目录>\scripts\apply-plan.ps1" -ReportPath "<扫描报告绝对路径>" -Items @(1,2,3,4,5,6,9) -AcknowledgeIrreversible @(9) -WhatIf
+powershell -NoProfile -ExecutionPolicy Bypass -File "<skill目录>\scripts\clean.ps1" -ReportPath "<体检报告绝对路径>"
 ```
 
-编号仅为示例，假设 9 是已明确点名的不可逆项。`-AcknowledgeIrreversible` 在此入口是整数编号数组，覆盖所选不可逆项且不能含未选项；无不可逆项则省略。底层 `clean-system.ps1` 的同名参数是开关，不要混淆。
-
-演练后给短差异说明：“将处理 {编号与完整范围}；将跳过 {项目及原因}；需关闭 {程序}；需管理员 {是/否}；重启 {要求}；相对确认清单 {无变化/具体变化}”。演练不启动外部工具、不改服务、不写结果或审计日志；DevCache 位置待实际执行查询，不能声称已验证实际工具路径。普通会话的管理员项会整项跳过演练，要如实说明其处理器未运行、执行时仍须校验权限和状态。
-
-范围未改变就继续，不再让用户逐项确认或重复确认同一清单。仅在计划改变时重新展示受影响清单并确认，例如演练显示不同范围、增加项目、报告过旧需要重扫。报告默认从扫描开始计时最多 24 小时；不为继续执行而调大 `-MaxReportAgeHours`。同一报告的正常占用 / 更新状态跳过不扩大范围，不需要额外逐项确认。
-
-确认并演练后，只给用户 **一条** 可复制到“以管理员身份运行”的 PowerShell 终端的命令；须用扫描时同一账户提权，不自动提权、不绕过 UAC：
+若用户还点名清空回收站，增加 `-Include "system:RecycleBin"`。多项用 PowerShell 调用运算符传数组，AI 自己执行：
 
 ```powershell
-& "<skill目录>\scripts\apply-plan.ps1" -ReportPath "<扫描报告绝对路径>" -Items @(1,2,3,4,5,6,9) -AcknowledgeIrreversible @(9)
+& "<skill目录>\scripts\clean.ps1" -ReportPath "<体检报告绝对路径>" -Include @('system:RecycleBin','system:WindowsOld')
 ```
 
-若当前会话已同账户提权且用户已确认，AI 直接运行这一条实际命令。不要先在普通会话执行部分清理再让用户重跑整表。执行器只接受同机、同原用户 SID / 目录、版本 3 的有效报告，重新校验白名单处理器及真实参数，常规用户缓存先执行、系统项随后、不可逆项最后；底层不重复询问已授权的 A 项，不用循环拼接逐项确认。
+需要演练时在同一调用上加 `-WhatIf`，演练后范围相同就继续。包含管理员项目时，执行前告知“会出现一次系统权限确认，请点‘是’”。报告过期（24 小时）、账户不符或内容无效时重新体检；范围变化才重新说明并确认。
 
-告知用户先正常退出相关应用，不自动杀进程。占用、权限不足、更新活动或状态未知按脚本跳过；失败不扩大权限重试。脚本可因系统工具不可用而跳过或仅给界面指引，不能据此声称释放完成。
+读取 `pc-care/clean/1`：报告总 `FreedBytes` 为“约 X GB（估算）”，参考 `FreeBefore/FreeAfter`；未知不报零，负值说明期间其他程序可能占用了更多空间。逐项把 `Partial/Skipped/Failed` 的 `Reason` 解释为普通中文，不声称全部成功，不叠加各项目估算当成实得。
 
-## 4. 读取结果，仍用 A / B / C 交付
+## 3. 搬家：逐项完成，试用后释放原件
 
-AI 读取实际生成的结果 JSON：`FreeBytesBefore`、`FreeBytesAfter`、逐项 `Items` 中的 `Result` / `FreedBytes` / `Messages`、`RescanReportPath`。结果文件 `SchemaVersion=1`，不同于扫描报告的版本 3；演练不生成结果文件。
+先读 [搬家、进度与还原](references/migration.md)。当前分支尚未合入 `scripts/move.ps1`；搬家须等该入口和后台状态接口可用，不能改用旧底层入口替代。
 
-A 中报告执行前后可用空间及差值，并分别统计 `done`、`partial`、`skipped`、`failed`，说明跳过 / 失败原因。默认已有一次 Quick 复扫，需完整大小时再用新文件名完整扫描。后台下载 / 更新会影响差值，负值表示空闲减少，未知不能冒充零；系统工具可能尚在后台或要求重启，完成后验证。B 中列出尚余 M 项及下一步，C 继续依据 Advisory 给建议。
-
-列出实际扫描报告、结果 JSON、JSONL 审计日志路径；默认在原用户 `%LOCALAPPDATA%\CDriveCleaner\Logs`，以实际输出为准。日志不是数据备份，不提供恢复已删文件的能力；读不到结果就明确说明待核实，不推断执行成功。
-
-## 5. B 类迁移逐步指导
-
-迁移不进入 apply-plan。按 [迁移参考](references/migration.md) 一步一确认：核对数据卷容量 / 本地固定 NTFS / 路径权限 → 独立备份并停止写入 → 复制校验 → 官方界面或工具配置切换 → 试用、必要时重启验证 → 确认独立备份可恢复后，另行讨论删除旧源。D: 同盘不算独立备份，脚本不做分区。
+- 从体检 `DataVolumes` 中替用户选择本地固定 NTFS 数据盘，容量要装得下本项数据并留至少 10% 余量；推荐专用空目录，不把盘符或底层实现交给用户决定。没有合适的数据盘就进入分区规划。
+- 说明搬哪个文件夹、多大、搬到哪里、原件先保留，取得本项确认。一次处理一个项目并等待完成，优先聊天文件，再搬包含它们的文档文件夹。
 
 ```powershell
-& "<skill目录>\scripts\migrate.ps1" -Item UserFolder -Folder Downloads -Destination "D:\UserData\Downloads" -VerifyHash -WhatIf
+powershell -NoProfile -ExecutionPolicy Bypass -File "<skill目录>\scripts\move.ps1" -Kind KnownFolder -Folder Downloads -Destination "D:\资料\下载"
+powershell -NoProfile -ExecutionPolicy Bypass -File "<skill目录>\scripts\move.ps1" -Kind WeChat -Destination "D:\资料\微信"
 ```
 
-目标须替换为已核实的专用空目录。实际迁移加 `-Confirm`，在交互提示处逐步等待确认，不代答“全部是”；无阶段选择参数。`UserFolder`、`DevCache`、`AppData`、`WSL`、`Junction` 的参数组合见参考。开发缓存清理新增 yarn / pnpm / go 不表示迁移新增同名选择器。游戏 / Docker / 虚拟磁盘压缩走官方人工流程。
+`KnownFolder` 支持 Desktop / Documents / Downloads / Pictures / Videos；QQ 用 `-Kind QQ`。示例目标须按实际数据盘调整。
 
-所有迁移保留源；旧源还在就不能声称其空间已释放。联接回滚仅移除核实的联接本身、恢复保留目录，不递归删除目标；WSL 新名导入且不自动注销旧发行版，注销须验证新环境、备份和准确旧名后另行确认。
+- `NeedsAppExit`：请用户正常退出 `Reason` 指明的软件，收到答复后重跑原指令；绝不杀进程。
+- 请求默认启动后台工作进程，很快返回 `Running` 和 `Id`。保存原指令、Id 和结果路径，按 `NextAction`（通常每 30 秒）执行下列查询，持续至最终状态；工具调用结束不等于搬家结束：
 
-## 始终遵守的安全边界
+  ```powershell
+  powershell -NoProfile -ExecutionPolicy Bypass -File "<skill目录>\scripts\move.ps1" -Status -Id "<本次Id>"
+  ```
 
-- 只删除当前脚本支持且共享校验通过的白名单具体项。执行前重新检查目标及每一级父目录，不跟随联接或符号链接；未知类别、未知数据只报告。路径操作使用 `-LiteralPath`，不拼接通配递归删除命令，不绕过脚本校验。
-- 禁止手删 `C:\Windows\WinSxS`、`System32`、`Installer`、`DriverStore`、`servicing`、`Recovery`、`System Volume Information`、`WindowsApps`、`C:\ProgramData\Package Cache`；只能在授权范围内使用系统受支持工具。
-- 不直接删除 `Program Files` / `Program Files (x86)` 下的软件目录；走卸载或官方移动。不整体移动或删除 `AppData` / `ProgramData`，不做注册表清理，不触碰浏览器书签、密码、Cookie、会话及站点用户数据。
-- 不直接删除 `.vhdx`，不使用 DISM `/ResetBase`，复制不用 `robocopy /MIR`、`/PURGE`、`/MOVE`。Docker 容器清理不是现有系统脚本动作，卷清理须单独解释和确认，不能自动附加卷删除选项。
-- 不删除 OneDrive 或其他同步目录文件；核实已上传且可取回后，只用客户端“释放空间 / 仅在线”。退出客户端不等于删除不会在下次同步时传播。
-- 不绕过 UAC、不自动提权、不夺取所有权、不自动杀进程。保持原用户身份边界；身份无法核实就停止用户目录操作，不借另一管理员账户执行计划、开发缓存清理或迁移。
-- 任何删除都须先取得对具体编号清单的明确确认；失败、中断、空间不足或校验不符时停止当前项，保留两端数据与证据，不跳过校验、不扩大权限、不自动清空目标重试。迁移始终保留旧源，删除旧源是另行确认的人工步骤。
+- `Running`：用已处理文件 / 字节数解释进度，继续查询。`Stalled`：重跑同一条操作指令以续传，沿用原目标和记录，不清空目标、不创建第二项。`-Status`、`NextAction` 及后台行为待 v1/move 合入。
+- 复制期间用户文件变化会自动补拷，最多 3 轮；仍变化时请用户暂时停止修改该文件夹后续传。微信、QQ 始终需退出。
+- `Done`：结合本次操作和 `SourceKept` 判断；搬家完成后，请用户正常使用软件或文件夹一段时间。原件还在时不能说 C 盘已腾出这部分空间。`SkippedLinks` 是正常跳过的链接数量，无需用户处理。
+- 用户明确确认使用正常并同意删除保留原件后，再运行释放指令，并同样查询至结束：
+
+  ```powershell
+  powershell -NoProfile -ExecutionPolicy Bypass -File "<skill目录>\scripts\move.ps1" -ReleaseSource -Id "<本次Id>"
+  ```
+
+- 试用后目标新增或修改文件正常；释放校验接受 `ChangedAfterMove`，且允许目标缺失的原文件数和字节数分别不超过 2%。这不是让用户选择的容差，不因正常变化要求用户撤销编辑。旧原件有变化或目标缺失过多时会拒绝释放，说明原因并保留数据。
+- 释放前用户要还原时，AI 执行 `scripts/move.ps1 -Rollback -Id "<本次Id>"`，继续按 `NextAction` 查询。新位置数据保留；搬家后的新文件或修改须继续保管，不能保证自动合并回旧位置。原件已释放后不能承诺还原。
+
+## 4. 分区：先方案，再二次确认
+
+当 `NextStep=partition` 或用户要求分区时，读 [分区与加密规则](references/partition.md)，普通权限运行：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File "<skill目录>\scripts\partition.ps1" -Plan
+```
+
+1. 读取 `pc-care/partition-plan/1`。向用户用人话展示 `Summary`、`Before/After` 大小变化和 `Warnings`；提醒先备份，同一硬盘不同分区不算备份。`Feasible=false` 则解释 `Blockers` 并停止。
+2. 用户要调整用途或盘数时，由 AI 构造 `-Layout` 的布局 JSON 重新规划；不把 JSON 或参数给用户选择。已有合适数据盘时通常直接搬家。
+3. `PendingChecks` 是执行前待验证项，不能说已通过，也不为补检查而先提权。执行时脚本会验证；失败须遵从结果。
+4. `RequiresRecoveryKeyConfirmation=true`：展示 `RecoveryKeyHint`，补充可在 https://aka.ms/myrecoverykey、打印件、U 盘或保存的文件中找恢复密钥；请用户在聊天中确认能找到。不要要求发送密钥本身，也不代替用户确认。
+5. 展示最终方案后，必须得到第二次明确的聊天确认才运行下列执行指令；“想分区”或“帮我看看”不算。恢复密钥确认可与方案二次确认在同一条回复里完成，但两者都须明确。
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File "<skill目录>\scripts\partition.ps1" -Apply -PlanPath "<方案绝对路径>"
+```
+
+仅在用户已确认能找到密钥时加 `-RecoveryKeyConfirmed`。`NeedsRecoveryKeyConfirmation` 表示尚未改分区，请先问清并在确认后带该开关重跑；若之前从未得到方案二次确认，也必须补齐。C 盘正在加密 / 解密、执行时状态未知、没有恢复密码保护器或无法读取保护器均会阻止压缩；未加密或只使用空闲空间新建分区无需密钥确认。
+
+执行会按需弹 UAC；C 盘保留至少“已用空间 + 60 GB”且不少于 120 GB。脚本先建无盘符分区、格式化，再分配盘符，避免弹出“格式化磁盘”。读取 `pc-care/partition/1`，按实际布局解释结果；成功后重新体检，再逐项搬家。
+
+任何可能已修改布局的失败（包括管理员结果缺失），都不重跑 `-Apply`：先重新 `-Plan`、核实当前布局，说明新方案并再次明确确认。不要自动删除新分区、重新格式化或补做未完成步骤。
+
+## 安全与范围
+
+- 所有路径和动作交给脚本及其白名单重新校验，不凭报告路径自行删除。占用、权限不足、同步目录、无法核实的位置按原因跳过，不夺取所有权、不强行停止程序。
+- V1 不处理开发者缓存（npm/pip 等）、WSL、Docker、卷影副本 / 还原点存储、系统保留存储、页面文件、组件存储 / DISM、注册表清理、卸载软件。大软件只报告；不因底层处理器留有旧能力而调用它们。
+- 不手删系统目录、软件安装目录、聊天记录、浏览器登录信息或同步文件；搬家只复制并验证允许的数据，释放仅删除本次记录中的保留原件。
+- 不移动、合并或删除已有分区，不扩容 C 盘，不低于保留空间压缩，不处理特殊磁盘组合或有数据的其他硬盘。
+- 尚未在真实 Windows 上完成验证；Linux 模拟通过不代表真机通过。真实修改流程须先在 Windows 10 / 11 测试环境验证。
